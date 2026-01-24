@@ -1,0 +1,1422 @@
+package main
+
+import (
+	"crypto/hmac"
+	"crypto/sha256"
+	"database/sql"
+	"embed"
+	"encoding/hex"
+	"fmt"
+	"log"
+	"net/http"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"time"
+
+	"server-go/ui"
+
+	"github.com/gin-gonic/gin"
+	_ "github.com/mattn/go-sqlite3"
+)
+
+//go:embed build/*
+var staticFS embed.FS
+
+const (
+	PORT         = 3001
+	HMAC_SECRET  = "your-hmac-secret-key"
+	DB_PATH      = "../database.db"
+	FRONTEND_URL = "http://localhost:5175"
+)
+
+var mainDB *sql.DB
+
+type Date struct {
+	time.Time
+}
+
+func (d Date) MarshalJSON() ([]byte, error) {
+	return []byte(`"` + d.Format("2006-01-02") + `"`), nil
+}
+
+func (d *Date) Scan(value interface{}) error {
+	switch v := value.(type) {
+	case time.Time:
+		d.Time = v
+		return nil
+	case string:
+		t, err := time.Parse("2006-01-02", v)
+		if err != nil {
+			return err
+		}
+		d.Time = t
+		return nil
+	default:
+		return fmt.Errorf("unsupported type: %T", value)
+	}
+}
+
+// Timestamp type for full datetime formatting
+type Timestamp struct {
+	time.Time
+}
+
+func (t Timestamp) MarshalJSON() ([]byte, error) {
+	return []byte(`"` + t.Format("2006-01-02 15:04:05") + `"`), nil
+}
+
+func (t *Timestamp) Scan(value interface{}) error {
+	switch v := value.(type) {
+	case time.Time:
+		t.Time = v
+		return nil
+	case string:
+		// Try parsing as full datetime first, then as date-only
+		if parsed, err := time.Parse("2006-01-02 15:04:05", v); err == nil {
+			t.Time = parsed
+			return nil
+		}
+		// Fallback to date parsing
+		if parsed, err := time.Parse("2006-01-02", v); err == nil {
+			t.Time = parsed
+			return nil
+		}
+		return fmt.Errorf("unsupported timestamp format: %s", v)
+	default:
+		return fmt.Errorf("unsupported type for Timestamp: %T", value)
+	}
+}
+
+type User struct {
+	UserID       int        `json:"user_id"`
+	Name         string     `json:"name"`
+	EmployeeID   string     `json:"employee_id"`
+	ShiftType    *string    `json:"shift_type"`
+	Site         *string    `json:"site"`
+	DayNight     *string    `json:"day_night"`
+	Role         string     `json:"role"`
+	PasswordHash string     `json:"-"`
+	CreatedAt    *Timestamp `json:"created_at"`
+}
+
+type CalendarTag struct {
+	Date      Date    `json:"date"`
+	IsHoliday int     `json:"is_holiday"`
+	ShiftType *string `json:"shift_type"`
+	Comment   *string `json:"comment"`
+	UpdatedAt string  `json:"updated_at"`
+}
+
+type ShiftAssignment struct {
+	EmployeeID string     `json:"employee_id"`
+	Date       Date       `json:"date"`
+	ShiftType  string     `json:"shift_type"`
+	CreatedAt  *Timestamp `json:"created_at"`
+	UpdatedAt  *Timestamp `json:"updated_at"`
+}
+
+type LeaveType struct {
+	LeaveID      int        `json:"leave_id"`
+	Name         string     `json:"name"`
+	IsNotWorkday int        `json:"is_not_workday"`
+	Color        string     `json:"color"`
+	CreatedAt    *Timestamp `json:"created_at"`
+}
+
+type LeaveRecord struct {
+	UserID      int        `json:"user_id"`
+	LeaveTypeID int        `json:"leave_type_id"`
+	Date        string     `json:"date"`
+	TotalHours  float32    `json:"total_hours"`
+	CreatedAt   *Timestamp `json:"created_at"`
+}
+
+func main() {
+	// Initialize main database
+	var err error
+	mainDB, err = initDatabase(DB_PATH)
+	if err != nil {
+		log.Fatal("Failed to initialize database:", err)
+	}
+	defer mainDB.Close()
+
+	// Setup routes
+	router := gin.Default()
+
+	addRoutes(router)
+
+	ui.AddRoutes(router, staticFS)
+
+	log.Printf("🚀 API server running on http://localhost:%d", PORT)
+	router.Run(fmt.Sprintf(":%d", PORT))
+}
+
+func addRoutes(router *gin.Engine) {
+	api := router.Group("/api")
+	{
+		// Auth routes
+		api.POST("/login", loginHandler)
+		api.POST("/logout", logoutHandler)
+
+		// User routes
+		api.GET("/users", getUsersHandler)
+		api.POST("/users", createUserHandler)
+		api.GET("/users/:id", getUserHandler)
+		api.PUT("/users/:id", updateUserHandler)
+		api.DELETE("/users/:id", deleteUserHandler)
+
+		// Calendar tags routes
+		api.GET("/calendar-tags", getCalendarTagsHandler)
+		api.GET("/calendar-tags/:date", getCalendarTagHandler)
+		api.PUT("/calendar-tags/:date", setCalendarTagHandler)
+		api.DELETE("/calendar-tags/:date", deleteCalendarTagHandler)
+		api.POST("/calendar-tags/batch", batchCalendarTagsHandler)
+
+		// Shift assignments routes
+		api.GET("/shift-assignments/:employeeId", getShiftAssignmentsHandler)
+		api.PUT("/shift-assignments/:employeeId/:date", setShiftAssignmentHandler)
+		api.DELETE("/shift-assignments/:employeeId/:date", deleteShiftAssignmentHandler)
+		api.POST("/shift-assignments/:employeeId/move", moveShiftAssignmentHandler)
+
+		// Leave types routes
+		api.GET("/leave-types", getLeaveTypesHandler)
+		api.GET("/leave-types/:id", getLeaveTypeHandler)
+		api.POST("/leave-types", createLeaveTypeHandler)
+		api.PUT("/leave-types/:id", updateLeaveTypeHandler)
+		api.DELETE("/leave-types/:id", deleteLeaveTypeHandler)
+	}
+}
+
+func initDatabase(dbPath string) (*sql.DB, error) {
+	db, err := sql.Open("sqlite3", dbPath)
+	if err != nil {
+		return nil, err
+	}
+
+	// Enable foreign keys
+	_, err = db.Exec("PRAGMA foreign_keys = ON")
+	if err != nil {
+		return nil, err
+	}
+
+	// Create tables if they don't exist
+	err = createTables(db)
+	if err != nil {
+		return nil, err
+	}
+
+	log.Println("✅ Connected to database")
+	return db, nil
+}
+
+func createTables(db *sql.DB) error {
+	// Users table
+	usersTable := `
+	CREATE TABLE IF NOT EXISTS users (
+		user_id        INTEGER PRIMARY KEY AUTOINCREMENT,
+		name           TEXT NOT NULL,
+		employee_id    TEXT UNIQUE NOT NULL,
+		password_hash  TEXT NOT NULL,
+		shift_type     TEXT,
+		site           TEXT,
+		day_night      TEXT,
+		role           TEXT DEFAULT 'user',
+		created_at     DATETIME DEFAULT CURRENT_TIMESTAMP
+	)`
+
+	// Calendar tags table
+	calendarTagsTable := `
+	CREATE TABLE IF NOT EXISTS calendar_tags (
+		date        DATE PRIMARY KEY,
+		is_holiday  BOOLEAN DEFAULT 0,
+		shift_type  TEXT CHECK(shift_type IN ('A', 'B')),
+		comment     TEXT,
+		updated_at  DATETIME DEFAULT CURRENT_TIMESTAMP
+	)`
+
+	// Leave types table
+	leaveTypesTable := `
+	CREATE TABLE IF NOT EXISTS leave_types (
+		leave_id       INTEGER PRIMARY KEY AUTOINCREMENT,
+		name           TEXT UNIQUE NOT NULL,
+		is_not_workday INTEGER DEFAULT 0,
+		color          TEXT DEFAULT '#ff9800',
+		created_at     DATETIME DEFAULT CURRENT_TIMESTAMP
+	)`
+
+	tables := []string{usersTable, calendarTagsTable, leaveTypesTable}
+	for _, table := range tables {
+		_, err := db.Exec(table)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func hashPassword(password string) string {
+	h := hmac.New(sha256.New, []byte(HMAC_SECRET))
+	h.Write([]byte(password))
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// ==================== Authentication Handlers ====================
+
+func loginHandler(c *gin.Context) {
+	var req struct {
+		EmployeeID string `json:"employee_id"`
+		Password   string `json:"password"`
+	}
+
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request body"})
+		return
+	}
+
+	if req.EmployeeID == "" || req.Password == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "工號和密碼為必填項"})
+		return
+	}
+
+	var user User
+	var shiftType, site, dayNight sql.NullString
+	var createdAt sql.NullTime
+
+	err := mainDB.QueryRow(`
+		SELECT user_id, name, employee_id, shift_type, site, day_night, role, created_at
+		FROM users WHERE employee_id = ?
+	`, req.EmployeeID).Scan(
+		&user.UserID, &user.Name, &user.EmployeeID,
+		&shiftType, &site, &dayNight, &user.Role, &createdAt,
+	)
+
+	if err == sql.ErrNoRows {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "工號或密碼錯誤"})
+		return
+	} else if err != nil {
+		log.Printf("Login query error: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "登入失敗"})
+		return
+	}
+
+	// Check password
+	var passwordHash string
+	err = mainDB.QueryRow("SELECT password_hash FROM users WHERE employee_id = ?", req.EmployeeID).Scan(&passwordHash)
+	if err != nil {
+		log.Printf("Password query error: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "登入失敗"})
+		return
+	}
+
+	if hashPassword(req.Password) != passwordHash {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "工號或密碼錯誤"})
+		return
+	}
+
+	user.ShiftType = nilIfEmpty(shiftType)
+	user.Site = nilIfEmpty(site)
+	user.DayNight = nilIfEmpty(dayNight)
+	user.CreatedAt = nilIfZeroTimestamp(createdAt)
+
+	c.JSON(http.StatusOK, user)
+}
+
+func logoutHandler(c *gin.Context) {
+	c.JSON(http.StatusOK, gin.H{"message": "登出成功"})
+}
+
+func getUsersHandler(c *gin.Context) {
+	rows, err := mainDB.Query(`
+		SELECT user_id, name, employee_id, shift_type, site, day_night, role, created_at
+		FROM users ORDER BY created_at DESC
+	`)
+	if err != nil {
+		log.Printf("Get users error: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "获取用户列表失败"})
+		return
+	}
+	defer rows.Close()
+
+	var users []User
+	for rows.Next() {
+		var user User
+		var shiftType, site, dayNight sql.NullString
+		var createdAt sql.NullTime
+
+		err := rows.Scan(
+			&user.UserID, &user.Name, &user.EmployeeID,
+			&shiftType, &site, &dayNight, &user.Role, &createdAt,
+		)
+		if err != nil {
+			log.Printf("Scan user error: %v", err)
+			continue
+		}
+
+		user.ShiftType = nilIfEmpty(shiftType)
+		user.Site = nilIfEmpty(site)
+		user.DayNight = nilIfEmpty(dayNight)
+		user.CreatedAt = nilIfZeroTimestamp(createdAt)
+
+		users = append(users, user)
+	}
+
+	c.JSON(http.StatusOK, users)
+}
+
+func getUserHandler(c *gin.Context) {
+	userID := c.Param("id")
+
+	var user User
+	var shiftType, site, dayNight sql.NullString
+	var createdAt sql.NullTime
+
+	err := mainDB.QueryRow(`
+		SELECT user_id, name, employee_id, shift_type, site, day_night, role, created_at
+		FROM users WHERE user_id = ?
+	`, userID).Scan(
+		&user.UserID, &user.Name, &user.EmployeeID,
+		&shiftType, &site, &dayNight, &user.Role, &createdAt,
+	)
+
+	if err == sql.ErrNoRows {
+		c.JSON(http.StatusNotFound, gin.H{"error": "用户不存在"})
+		return
+	} else if err != nil {
+		log.Printf("Get user error: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "获取用户失败"})
+		return
+	}
+
+	user.ShiftType = nilIfEmpty(shiftType)
+	user.Site = nilIfEmpty(site)
+	user.DayNight = nilIfEmpty(dayNight)
+	user.CreatedAt = nilIfZeroTimestamp(createdAt)
+
+	c.JSON(http.StatusOK, user)
+}
+
+func createUserHandler(c *gin.Context) {
+	var req struct {
+		Name       string  `json:"name"`
+		EmployeeID string  `json:"employee_id"`
+		Password   string  `json:"password"`
+		ShiftType  *string `json:"shift_type"`
+		Site       *string `json:"site"`
+		DayNight   *string `json:"day_night"`
+		Role       string  `json:"role"`
+	}
+
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request body"})
+		return
+	}
+
+	if req.Name == "" || req.EmployeeID == "" || req.Password == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "姓名、工號和密碼為必填項"})
+		return
+	}
+
+	// Check if employee_id already exists
+	var existingID int
+	err := mainDB.QueryRow("SELECT user_id FROM users WHERE employee_id = ?", req.EmployeeID).Scan(&existingID)
+	if err == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "此工號已存在"})
+		return
+	} else if err != sql.ErrNoRows {
+		log.Printf("Check employee_id error: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "检查工號失败"})
+		return
+	}
+
+	role := req.Role
+	if role == "" {
+		role = "user"
+	}
+
+	passwordHash := hashPassword(req.Password)
+
+	result, err := mainDB.Exec(`
+		INSERT INTO users (name, employee_id, password_hash, shift_type, site, day_night, role)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
+	`, req.Name, req.EmployeeID, passwordHash, req.ShiftType, req.Site, req.DayNight, role)
+
+	if err != nil {
+		log.Printf("Create user error: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "创建用户失败"})
+		return
+	}
+
+	userID, _ := result.LastInsertId()
+
+	// Create user-specific database file
+	userDbPath := filepath.Join("..", fmt.Sprintf("%s.db", req.EmployeeID))
+
+	// Set hidden attribute on Windows
+	if runtime.GOOS == "windows" {
+		cmd := exec.Command("attrib", "+h", userDbPath)
+		err := cmd.Run()
+		if err != nil {
+			log.Printf("Failed to set hidden attribute on user DB: %v", err)
+		}
+	}
+
+	userDb, err := sql.Open("sqlite3", userDbPath)
+	if err != nil {
+		log.Printf("Create user DB error: %v", err)
+		// Don't return error, user is already created
+	} else {
+		// Create leave_records table
+		_, err = userDb.Exec(`
+			CREATE TABLE leave_records (
+				user_id        INTEGER NOT NULL,
+				leave_type_id  INTEGER NOT NULL,
+				date           DATE NOT NULL,
+				total_hours    DECIMAL(4,2) NOT NULL,
+				created_at     DATETIME DEFAULT CURRENT_TIMESTAMP
+			)
+		`)
+		if err != nil {
+			log.Printf("Create leave_records table error: %v", err)
+		} else {
+			log.Printf("✅ User database and table created: %s.db", req.EmployeeID)
+		}
+		userDb.Close()
+	}
+
+	response := map[string]interface{}{
+		"user_id":     int(userID),
+		"name":        req.Name,
+		"employee_id": req.EmployeeID,
+		"shift_type":  req.ShiftType,
+		"site":        req.Site,
+		"day_night":   req.DayNight,
+		"role":        role,
+	}
+
+	c.JSON(http.StatusCreated, response)
+}
+
+func updateUserHandler(c *gin.Context) {
+	userID := c.Param("id")
+
+	var req struct {
+		Name       string  `json:"name"`
+		EmployeeID string  `json:"employee_id"`
+		ShiftType  *string `json:"shift_type"`
+		Site       *string `json:"site"`
+		DayNight   *string `json:"day_night"`
+		Role       string  `json:"role"`
+		Password   string  `json:"password"`
+	}
+
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request body"})
+		return
+	}
+
+	// Check if user exists
+	var existingID int
+	err := mainDB.QueryRow("SELECT user_id FROM users WHERE user_id = ?", userID).Scan(&existingID)
+	if err == sql.ErrNoRows {
+		c.JSON(http.StatusNotFound, gin.H{"error": "用户不存在"})
+		return
+	} else if err != nil {
+		log.Printf("Check user exists error: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "检查用户失败"})
+		return
+	}
+
+	// Check employee_id conflict if provided
+	if req.EmployeeID != "" {
+		var conflictID int
+		err := mainDB.QueryRow("SELECT user_id FROM users WHERE employee_id = ? AND user_id != ?", req.EmployeeID, userID).Scan(&conflictID)
+		if err == nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "此工號已被其他用户使用"})
+			return
+		} else if err != sql.ErrNoRows {
+			log.Printf("Check employee_id conflict error: %v", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "检查工號冲突失败"})
+			return
+		}
+	}
+
+	// Build update query
+	setParts := []string{}
+	args := []interface{}{}
+
+	if req.Name != "" {
+		setParts = append(setParts, "name = ?")
+		args = append(args, req.Name)
+	}
+	if req.EmployeeID != "" {
+		setParts = append(setParts, "employee_id = ?")
+		args = append(args, req.EmployeeID)
+	}
+	if req.Password != "" {
+		setParts = append(setParts, "password_hash = ?")
+		args = append(args, hashPassword(req.Password))
+	}
+	if req.ShiftType != nil {
+		setParts = append(setParts, "shift_type = ?")
+		args = append(args, *req.ShiftType)
+	}
+	if req.Site != nil {
+		setParts = append(setParts, "site = ?")
+		args = append(args, *req.Site)
+	}
+	if req.DayNight != nil {
+		setParts = append(setParts, "day_night = ?")
+		args = append(args, *req.DayNight)
+	}
+	if req.Role != "" {
+		setParts = append(setParts, "role = ?")
+		args = append(args, req.Role)
+	}
+
+	if len(setParts) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "没有提供要更新的字段"})
+		return
+	}
+
+	query := fmt.Sprintf("UPDATE users SET %s WHERE user_id = ?", strings.Join(setParts, ", "))
+	args = append(args, userID)
+
+	result, err := mainDB.Exec(query, args...)
+	if err != nil {
+		log.Printf("Update user error: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "更新用户失败"})
+		return
+	}
+
+	rowsAffected, _ := result.RowsAffected()
+	c.JSON(http.StatusOK, gin.H{
+		"message": "用户更新成功",
+		"changes": rowsAffected,
+	})
+}
+
+func deleteUserHandler(c *gin.Context) {
+	userID := c.Param("id")
+
+	// Get employee_id first
+	var employeeID string
+	err := mainDB.QueryRow("SELECT employee_id FROM users WHERE user_id = ?", userID).Scan(&employeeID)
+	if err == sql.ErrNoRows {
+		c.JSON(http.StatusNotFound, gin.H{"error": "用户不存在"})
+		return
+	} else if err != nil {
+		log.Printf("Get employee_id error: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "获取用户工號失败"})
+		return
+	}
+
+	// Delete user
+	result, err := mainDB.Exec("DELETE FROM users WHERE user_id = ?", userID)
+	if err != nil {
+		log.Printf("Delete user error: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "删除用户失败"})
+		return
+	}
+
+	rowsAffected, _ := result.RowsAffected()
+	if rowsAffected == 0 {
+		c.JSON(http.StatusNotFound, gin.H{"error": "用户不存在"})
+		return
+	}
+
+	// Delete user-specific database file
+	userDbPath := filepath.Join("..", fmt.Sprintf("%s.db", employeeID))
+	if err := os.Remove(userDbPath); err != nil && !os.IsNotExist(err) {
+		log.Printf("Delete user DB error: %v", err)
+		// Don't return error, user is already deleted
+	} else {
+		log.Printf("✅ User database file deleted: %s.db", employeeID)
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "用户删除成功"})
+}
+
+// ==================== Utility Functions ====================
+
+func nilIfEmpty(ns sql.NullString) *string {
+	if ns.Valid {
+		return &ns.String
+	}
+	return nil
+}
+
+func nilIfZero(nt sql.NullTime) *time.Time {
+	if nt.Valid {
+		return &nt.Time
+	}
+	return nil
+}
+
+func nilIfZeroDate(nt sql.NullTime) *Date {
+	if nt.Valid {
+		d := Date{Time: nt.Time}
+		return &d
+	}
+	return nil
+}
+
+func nilIfZeroTimestamp(nt sql.NullTime) *Timestamp {
+	if nt.Valid {
+		t := Timestamp{Time: nt.Time}
+		return &t
+	}
+	return nil
+}
+
+func nilIfEmptyString(ns sql.NullString) *string {
+	if ns.Valid {
+		return &ns.String
+	}
+	return nil
+}
+
+func getCalendarTagsHandler(c *gin.Context) {
+	rows, err := mainDB.Query("SELECT date, is_holiday, shift_type, updated_at, comment FROM calendar_tags ORDER BY date")
+	if err != nil {
+		log.Printf("Get calendar tags error: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "获取日历标签失败"})
+		return
+	}
+	defer rows.Close()
+
+	var tags []CalendarTag
+	for rows.Next() {
+		var tag CalendarTag
+		var isHoliday bool
+		var comment sql.NullString
+
+		err := rows.Scan(&tag.Date, &isHoliday, &tag.ShiftType, &tag.UpdatedAt, &comment)
+		if err != nil {
+			log.Printf("Scan calendar tag error: %v", err)
+			continue
+		}
+
+		// Convert boolean to int for JSON response
+		if isHoliday {
+			tag.IsHoliday = 1
+		} else {
+			tag.IsHoliday = 0
+		}
+
+		tag.Comment = nilIfEmptyString(comment)
+
+		tags = append(tags, tag)
+	}
+
+	c.JSON(http.StatusOK, tags)
+}
+
+func getCalendarTagHandler(c *gin.Context) {
+	date := c.Param("date")
+
+	var tag CalendarTag
+	var isHoliday bool
+	var comment sql.NullString
+
+	err := mainDB.QueryRow("SELECT date, is_holiday, shift_type, updated_at, comment FROM calendar_tags WHERE date = ?", date).Scan(
+		&tag.Date, &isHoliday, &tag.ShiftType, &tag.UpdatedAt, &comment,
+	)
+
+	if err == sql.ErrNoRows {
+		c.JSON(http.StatusOK, nil)
+		return
+	} else if err != nil {
+		log.Printf("Get calendar tag error: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "获取日历标签失败"})
+		return
+	}
+
+	// Convert boolean to int for JSON response
+	if isHoliday {
+		tag.IsHoliday = 1
+	} else {
+		tag.IsHoliday = 0
+	}
+
+	tag.Comment = nilIfEmptyString(comment)
+
+	c.JSON(http.StatusOK, tag)
+}
+
+func setCalendarTagHandler(c *gin.Context) {
+	date := c.Param("date")
+
+	var req struct {
+		IsHoliday *bool   `json:"is_holiday"`
+		ShiftType *string `json:"shift_type"`
+		Comment   string  `json:"comment"`
+	}
+
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request body"})
+		return
+	}
+
+	// Check if date already exists
+	var existingDate string
+	err := mainDB.QueryRow("SELECT date FROM calendar_tags WHERE date = ?", date).Scan(&existingDate)
+
+	if err == sql.ErrNoRows {
+		// Insert new record
+		isHoliday := false
+		if req.IsHoliday != nil {
+			isHoliday = *req.IsHoliday
+		}
+
+		_, err = mainDB.Exec(
+			"INSERT INTO calendar_tags (date, is_holiday, shift_type, comment) VALUES (?, ?, ?, ?)",
+			date, isHoliday, req.ShiftType, req.Comment,
+		)
+		if err != nil {
+			log.Printf("Create calendar tag error: %v", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "创建日历标签失败"})
+			return
+		}
+
+		c.JSON(http.StatusCreated, gin.H{
+			"message": "日历标签创建成功",
+			"date":    date,
+		})
+	} else if err != nil {
+		log.Printf("Check calendar tag exists error: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "检查日期失败"})
+		return
+	} else {
+		// Update existing record
+		setParts := []string{}
+		args := []interface{}{}
+
+		if req.IsHoliday != nil {
+			setParts = append(setParts, "is_holiday = ?")
+			args = append(args, *req.IsHoliday)
+		}
+		if req.ShiftType != nil {
+			setParts = append(setParts, "shift_type = ?")
+			args = append(args, *req.ShiftType)
+		}
+		if req.Comment != "" {
+			setParts = append(setParts, "comment = ?")
+			args = append(args, req.Comment)
+		}
+
+		if len(setParts) == 0 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "没有提供要更新的字段"})
+			return
+		}
+
+		query := fmt.Sprintf("UPDATE calendar_tags SET %s WHERE date = ?", strings.Join(setParts, ", "))
+		args = append(args, date)
+
+		_, err = mainDB.Exec(query, args...)
+		if err != nil {
+			log.Printf("Update calendar tag error: %v", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "更新日历标签失败"})
+			return
+		}
+
+		c.JSON(http.StatusOK, gin.H{
+			"message": "日历标签更新成功",
+			"date":    date,
+		})
+	}
+}
+
+func deleteCalendarTagHandler(c *gin.Context) {
+	date := c.Param("date")
+
+	result, err := mainDB.Exec("DELETE FROM calendar_tags WHERE date = ?", date)
+	if err != nil {
+		log.Printf("Delete calendar tag error: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "删除日历标签失败"})
+		return
+	}
+
+	rowsAffected, _ := result.RowsAffected()
+	if rowsAffected == 0 {
+		c.JSON(http.StatusNotFound, gin.H{"error": "日历标签不存在"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "日历标签删除成功"})
+}
+
+func batchCalendarTagsHandler(c *gin.Context) {
+	var req struct {
+		Tags []struct {
+			Date      string  `json:"date"`
+			IsHoliday *bool   `json:"is_holiday"`
+			ShiftType *string `json:"shift_type"`
+			Comment   string  `json:"comment"`
+		} `json:"tags"`
+	}
+
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request body"})
+		return
+	}
+
+	if len(req.Tags) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "无效的标签数组"})
+		return
+	}
+
+	tx, err := mainDB.Begin()
+	if err != nil {
+		log.Printf("Begin transaction error: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "开始事务失败"})
+		return
+	}
+	defer tx.Rollback()
+
+	var errors []map[string]interface{}
+	successCount := 0
+
+	for _, tag := range req.Tags {
+		isHoliday := false
+		if tag.IsHoliday != nil {
+			isHoliday = *tag.IsHoliday
+		}
+
+		_, err = tx.Exec(`
+			INSERT INTO calendar_tags (date, is_holiday, shift_type, comment)
+			VALUES (?, ?, ?, ?)
+			ON CONFLICT(date) DO UPDATE SET
+				is_holiday = excluded.is_holiday,
+				shift_type = excluded.shift_type,
+				comment = excluded.comment
+		`, tag.Date, isHoliday, tag.ShiftType, tag.Comment)
+
+		if err != nil {
+			errors = append(errors, map[string]interface{}{
+				"date":  tag.Date,
+				"error": err.Error(),
+			})
+		} else {
+			successCount++
+		}
+	}
+
+	if err = tx.Commit(); err != nil {
+		log.Printf("Commit transaction error: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "提交事务失败"})
+		return
+	}
+
+	if len(errors) > 0 {
+		c.JSON(http.StatusPartialContent, gin.H{
+			"message": "批量操作完成，但有部分失败",
+			"errors":  errors,
+			"success": successCount,
+			"total":   len(req.Tags),
+		})
+	} else {
+		c.JSON(http.StatusOK, gin.H{
+			"message": "批量操作成功",
+			"count":   successCount,
+		})
+	}
+}
+
+func getShiftAssignmentsHandler(c *gin.Context) {
+	employeeID := c.Param("employeeId")
+
+	userDbPath := filepath.Join("..", fmt.Sprintf("%s.db", employeeID))
+
+	// Check if user database exists
+	if _, err := os.Stat(userDbPath); os.IsNotExist(err) {
+		c.JSON(http.StatusNotFound, gin.H{"error": "用户数据库不存在"})
+		return
+	}
+
+	userDb, err := sql.Open("sqlite3", userDbPath)
+	if err != nil {
+		log.Printf("Open user DB error: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "连接用户数据库失败"})
+		return
+	}
+	defer userDb.Close()
+
+	// Ensure shift_assignments table exists
+	_, err = userDb.Exec(`
+		CREATE TABLE IF NOT EXISTS shift_assignments (
+			employee_id    TEXT NOT NULL,
+			date           DATE NOT NULL,
+			shift_type     TEXT NOT NULL,
+			created_at     DATETIME DEFAULT CURRENT_TIMESTAMP,
+			updated_at     DATETIME DEFAULT CURRENT_TIMESTAMP,
+			PRIMARY KEY (employee_id, date)
+		)
+	`)
+	if err != nil {
+		log.Printf("Create shift_assignments table error: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "创建表失败"})
+		return
+	}
+
+	rows, err := userDb.Query("SELECT employee_id, date, shift_type, created_at, updated_at FROM shift_assignments ORDER BY date")
+	if err != nil {
+		log.Printf("Get shift assignments error: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "获取排班数据失败"})
+		return
+	}
+	defer rows.Close()
+
+	var assignments []ShiftAssignment
+	for rows.Next() {
+		var assignment ShiftAssignment
+		var createdAt, updatedAt sql.NullTime
+
+		err := rows.Scan(&assignment.EmployeeID, &assignment.Date, &assignment.ShiftType, &createdAt, &updatedAt)
+		if err != nil {
+			log.Printf("Scan shift assignment error: %v", err)
+			continue
+		}
+
+		assignment.CreatedAt = nilIfZeroTimestamp(createdAt)
+		assignment.UpdatedAt = nilIfZeroTimestamp(updatedAt)
+
+		assignments = append(assignments, assignment)
+	}
+
+	c.JSON(http.StatusOK, assignments)
+}
+
+func setShiftAssignmentHandler(c *gin.Context) {
+	employeeID := c.Param("employeeId")
+	date := c.Param("date")
+
+	var req struct {
+		ShiftType string `json:"shift_type"`
+	}
+
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request body"})
+		return
+	}
+
+	if req.ShiftType == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "排班类型为必填项"})
+		return
+	}
+
+	userDbPath := filepath.Join("..", fmt.Sprintf("%s.db", employeeID))
+
+	// Check if user database exists
+	if _, err := os.Stat(userDbPath); os.IsNotExist(err) {
+		c.JSON(http.StatusNotFound, gin.H{"error": "用户数据库不存在"})
+		return
+	}
+
+	userDb, err := sql.Open("sqlite3", userDbPath)
+	if err != nil {
+		log.Printf("Open user DB error: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "连接用户数据库失败"})
+		return
+	}
+	defer userDb.Close()
+
+	// Ensure shift_assignments table exists
+	_, err = userDb.Exec(`
+		CREATE TABLE IF NOT EXISTS shift_assignments (
+			employee_id    TEXT NOT NULL,
+			date           DATE NOT NULL,
+			shift_type     TEXT NOT NULL,
+			created_at     DATETIME DEFAULT CURRENT_TIMESTAMP,
+			updated_at     DATETIME DEFAULT CURRENT_TIMESTAMP,
+			PRIMARY KEY (employee_id, date)
+		)
+	`)
+	if err != nil {
+		log.Printf("Create shift_assignments table error: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "创建表失败"})
+		return
+	}
+
+	// Insert or update shift assignment
+	_, err = userDb.Exec(`
+		INSERT INTO shift_assignments (employee_id, date, shift_type)
+		VALUES (?, ?, ?)
+		ON CONFLICT(employee_id, date) DO UPDATE SET
+			shift_type = excluded.shift_type,
+			updated_at = CURRENT_TIMESTAMP
+	`, employeeID, date, req.ShiftType)
+
+	if err != nil {
+		log.Printf("Save shift assignment error: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "保存排班失败"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"employee_id": employeeID,
+		"date":        date,
+		"shift_type":  req.ShiftType,
+		"message":     "排班保存成功",
+	})
+}
+
+func deleteShiftAssignmentHandler(c *gin.Context) {
+	employeeID := c.Param("employeeId")
+	date := c.Param("date")
+
+	userDbPath := filepath.Join("..", fmt.Sprintf("%s.db", employeeID))
+
+	// Check if user database exists
+	if _, err := os.Stat(userDbPath); os.IsNotExist(err) {
+		c.JSON(http.StatusNotFound, gin.H{"error": "用户数据库不存在"})
+		return
+	}
+
+	userDb, err := sql.Open("sqlite3", userDbPath)
+	if err != nil {
+		log.Printf("Open user DB error: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "连接用户数据库失败"})
+		return
+	}
+	defer userDb.Close()
+
+	result, err := userDb.Exec("DELETE FROM shift_assignments WHERE employee_id = ? AND date = ?", employeeID, date)
+	if err != nil {
+		log.Printf("Delete shift assignment error: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "删除排班失败"})
+		return
+	}
+
+	rowsAffected, _ := result.RowsAffected()
+	if rowsAffected == 0 {
+		c.JSON(http.StatusNotFound, gin.H{"error": "排班不存在"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "排班删除成功"})
+}
+
+func moveShiftAssignmentHandler(c *gin.Context) {
+	employeeID := c.Param("employeeId")
+
+	var req struct {
+		FromDate     string `json:"from_date"`
+		ToEmployeeID string `json:"to_employee_id"`
+		ToDate       string `json:"to_date"`
+	}
+
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request body"})
+		return
+	}
+
+	if req.FromDate == "" || req.ToEmployeeID == "" || req.ToDate == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "缺少必要参数"})
+		return
+	}
+
+	userDbPath := filepath.Join("..", fmt.Sprintf("%s.db", employeeID))
+
+	// Check if user database exists
+	if _, err := os.Stat(userDbPath); os.IsNotExist(err) {
+		c.JSON(http.StatusNotFound, gin.H{"error": "用户数据库不存在"})
+		return
+	}
+
+	userDb, err := sql.Open("sqlite3", userDbPath)
+	if err != nil {
+		log.Printf("Open user DB error: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "连接用户数据库失败"})
+		return
+	}
+	defer userDb.Close()
+
+	// Get the shift to move
+	var shiftType string
+	err = userDb.QueryRow("SELECT shift_type FROM shift_assignments WHERE employee_id = ? AND date = ?", employeeID, req.FromDate).Scan(&shiftType)
+	if err == sql.ErrNoRows {
+		c.JSON(http.StatusNotFound, gin.H{"error": "源排班不存在"})
+		return
+	} else if err != nil {
+		log.Printf("Get shift assignment error: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "获取排班失败"})
+		return
+	}
+
+	// Check if target position already has an assignment
+	var existingShift string
+	err = userDb.QueryRow("SELECT shift_type FROM shift_assignments WHERE employee_id = ? AND date = ?", req.ToEmployeeID, req.ToDate).Scan(&existingShift)
+
+	if err == sql.ErrNoRows {
+		// Move to empty position
+		_, err = userDb.Exec(`
+			UPDATE shift_assignments SET employee_id = ?, date = ?, updated_at = CURRENT_TIMESTAMP
+			WHERE employee_id = ? AND date = ?
+		`, req.ToEmployeeID, req.ToDate, employeeID, req.FromDate)
+		if err != nil {
+			log.Printf("Move shift assignment error: %v", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "移动排班失败"})
+			return
+		}
+	} else if err != nil {
+		log.Printf("Check target position error: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "检查目标位置失败"})
+		return
+	} else {
+		// Swap assignments
+		_, err = userDb.Exec(`
+			UPDATE shift_assignments SET shift_type = ?, updated_at = CURRENT_TIMESTAMP
+			WHERE employee_id = ? AND date = ?
+		`, shiftType, req.ToEmployeeID, req.ToDate)
+		if err != nil {
+			log.Printf("Update target position error: %v", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "更新目标位置失败"})
+			return
+		}
+
+		_, err = userDb.Exec(`
+			UPDATE shift_assignments SET shift_type = ?, updated_at = CURRENT_TIMESTAMP
+			WHERE employee_id = ? AND date = ?
+		`, existingShift, employeeID, req.FromDate)
+		if err != nil {
+			log.Printf("Update source position error: %v", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "更新源位置失败"})
+			return
+		}
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "排班移动成功"})
+}
+
+func getLeaveTypesHandler(c *gin.Context) {
+	rows, err := mainDB.Query("SELECT leave_id, name, is_not_workday, color, created_at FROM leave_types ORDER BY created_at DESC")
+	if err != nil {
+		log.Printf("Get leave types error: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "获取请假类型失败"})
+		return
+	}
+	defer rows.Close()
+
+	var leaveTypes []LeaveType
+	for rows.Next() {
+		var leaveType LeaveType
+		var isNotWorkday bool
+		var createdAt sql.NullTime
+
+		err := rows.Scan(&leaveType.LeaveID, &leaveType.Name, &isNotWorkday, &leaveType.Color, &createdAt)
+		if err != nil {
+			log.Printf("Scan leave type error: %v", err)
+			continue
+		}
+
+		// Convert boolean to int for JSON response
+		if isNotWorkday {
+			leaveType.IsNotWorkday = 1
+		} else {
+			leaveType.IsNotWorkday = 0
+		}
+		leaveType.CreatedAt = nilIfZeroTimestamp(createdAt)
+
+		leaveTypes = append(leaveTypes, leaveType)
+	}
+
+	c.JSON(http.StatusOK, leaveTypes)
+}
+
+func getLeaveTypeHandler(c *gin.Context) {
+	leaveID := c.Param("id")
+
+	var leaveType LeaveType
+	var isNotWorkday bool
+	var createdAt sql.NullTime
+
+	err := mainDB.QueryRow("SELECT leave_id, name, is_not_workday, color, created_at FROM leave_types WHERE leave_id = ?", leaveID).Scan(
+		&leaveType.LeaveID, &leaveType.Name, &isNotWorkday, &leaveType.Color, &createdAt,
+	)
+
+	if err == sql.ErrNoRows {
+		c.JSON(http.StatusNotFound, gin.H{"error": "请假类型不存在"})
+		return
+	} else if err != nil {
+		log.Printf("Get leave type error: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "获取请假类型失败"})
+		return
+	}
+
+	// Convert boolean to int for JSON response
+	if isNotWorkday {
+		leaveType.IsNotWorkday = 1
+	} else {
+		leaveType.IsNotWorkday = 0
+	}
+	leaveType.CreatedAt = nilIfZeroTimestamp(createdAt)
+
+	c.JSON(http.StatusOK, leaveType)
+}
+
+func createLeaveTypeHandler(c *gin.Context) {
+	var req struct {
+		Name         string `json:"name"`
+		IsNotWorkday *bool  `json:"is_not_workday"`
+		Color        string `json:"color"`
+	}
+
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request body"})
+		return
+	}
+
+	if req.Name == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "请假类型名稱為必填項"})
+		return
+	}
+
+	// Check if name already exists
+	var existingID int
+	err := mainDB.QueryRow("SELECT leave_id FROM leave_types WHERE name = ?", req.Name).Scan(&existingID)
+	if err == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "此名稱已存在"})
+		return
+	} else if err != sql.ErrNoRows {
+		log.Printf("Check name error: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "检查名稱失败"})
+		return
+	}
+
+	isNotWorkday := 0
+	if req.IsNotWorkday != nil && *req.IsNotWorkday {
+		isNotWorkday = 1
+	}
+
+	color := req.Color
+	if color == "" {
+		color = "#ff9800"
+	}
+
+	result, err := mainDB.Exec(
+		"INSERT INTO leave_types (name, is_not_workday, color) VALUES (?, ?, ?)",
+		req.Name, isNotWorkday, color,
+	)
+	if err != nil {
+		log.Printf("Create leave type error: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "创建请假类型失败"})
+		return
+	}
+
+	leaveID, _ := result.LastInsertId()
+
+	response := map[string]interface{}{
+		"leave_id":       int(leaveID),
+		"name":           req.Name,
+		"is_not_workday": isNotWorkday,
+		"color":          color,
+	}
+
+	c.JSON(http.StatusCreated, response)
+}
+
+func updateLeaveTypeHandler(c *gin.Context) {
+	leaveID := c.Param("id")
+
+	var req struct {
+		Name         string `json:"name"`
+		IsNotWorkday *bool  `json:"is_not_workday"`
+		Color        string `json:"color"`
+	}
+
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request body"})
+		return
+	}
+
+	// Check if leave type exists
+	var existingID int
+	err := mainDB.QueryRow("SELECT leave_id FROM leave_types WHERE leave_id = ?", leaveID).Scan(&existingID)
+	if err == sql.ErrNoRows {
+		c.JSON(http.StatusNotFound, gin.H{"error": "请假类型不存在"})
+		return
+	} else if err != nil {
+		log.Printf("Check leave type exists error: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "检查请假类型失败"})
+		return
+	}
+
+	// Check name conflict if provided
+	if req.Name != "" {
+		var conflictID int
+		err := mainDB.QueryRow("SELECT leave_id FROM leave_types WHERE name = ? AND leave_id != ?", req.Name, leaveID).Scan(&conflictID)
+		if err == nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "此名稱已被其他请假类型使用"})
+			return
+		} else if err != sql.ErrNoRows {
+			log.Printf("Check name conflict error: %v", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "检查名稱冲突失败"})
+			return
+		}
+	}
+
+	// Build update query
+	setParts := []string{}
+	args := []interface{}{}
+
+	if req.Name != "" {
+		setParts = append(setParts, "name = ?")
+		args = append(args, req.Name)
+	}
+	if req.IsNotWorkday != nil {
+		isNotWorkday := 0
+		if *req.IsNotWorkday {
+			isNotWorkday = 1
+		}
+		setParts = append(setParts, "is_not_workday = ?")
+		args = append(args, isNotWorkday)
+	}
+	if req.Color != "" {
+		setParts = append(setParts, "color = ?")
+		args = append(args, req.Color)
+	}
+
+	if len(setParts) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "没有提供要更新的字段"})
+		return
+	}
+
+	query := fmt.Sprintf("UPDATE leave_types SET %s WHERE leave_id = ?", strings.Join(setParts, ", "))
+	args = append(args, leaveID)
+
+	result, err := mainDB.Exec(query, args...)
+	if err != nil {
+		log.Printf("Update leave type error: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "更新请假类型失败"})
+		return
+	}
+
+	rowsAffected, _ := result.RowsAffected()
+	c.JSON(http.StatusOK, gin.H{
+		"message": "请假类型更新成功",
+		"changes": rowsAffected,
+	})
+}
+
+func deleteLeaveTypeHandler(c *gin.Context) {
+	leaveID := c.Param("id")
+
+	result, err := mainDB.Exec("DELETE FROM leave_types WHERE leave_id = ?", leaveID)
+	if err != nil {
+		log.Printf("Delete leave type error: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "删除请假类型失败"})
+		return
+	}
+
+	rowsAffected, _ := result.RowsAffected()
+	if rowsAffected == 0 {
+		c.JSON(http.StatusNotFound, gin.H{"error": "请假类型不存在"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "请假类型删除成功"})
+}
