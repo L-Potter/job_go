@@ -12,7 +12,7 @@ import (
 	"path/filepath"
 	"runtime"
 
-	_ "github.com/mattn/go-sqlite3"
+	_ "modernc.org/sqlite"
 )
 
 const (
@@ -33,7 +33,7 @@ func main() {
 	fmt.Println("📦 Initializing database...")
 
 	// Create database connection
-	db, err := sql.Open("sqlite3", dbPath)
+	db, err := sql.Open("sqlite", dbPath)
 	if err != nil {
 		log.Fatalf("❌ Failed to connect to database: %v", err)
 	}

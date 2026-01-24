@@ -19,7 +19,7 @@ import (
 	"server-go/ui"
 
 	"github.com/gin-gonic/gin"
-	_ "github.com/mattn/go-sqlite3"
+	_ "modernc.org/sqlite"
 )
 
 //go:embed build/*
@@ -191,7 +191,7 @@ func addRoutes(router *gin.Engine) {
 }
 
 func initDatabase(dbPath string) (*sql.DB, error) {
-	db, err := sql.Open("sqlite3", dbPath)
+	db, err := sql.Open("sqlite", dbPath)
 	if err != nil {
 		return nil, err
 	}
@@ -464,7 +464,7 @@ func createUserHandler(c *gin.Context) {
 		}
 	}
 
-	userDb, err := sql.Open("sqlite3", userDbPath)
+	userDb, err := sql.Open("sqlite", userDbPath)
 	if err != nil {
 		log.Printf("Create user DB error: %v", err)
 		// Don't return error, user is already created
@@ -937,7 +937,7 @@ func getShiftAssignmentsHandler(c *gin.Context) {
 		return
 	}
 
-	userDb, err := sql.Open("sqlite3", userDbPath)
+	userDb, err := sql.Open("sqlite", userDbPath)
 	if err != nil {
 		log.Printf("Open user DB error: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "连接用户数据库失败"})
@@ -1016,7 +1016,7 @@ func setShiftAssignmentHandler(c *gin.Context) {
 		return
 	}
 
-	userDb, err := sql.Open("sqlite3", userDbPath)
+	userDb, err := sql.Open("sqlite", userDbPath)
 	if err != nil {
 		log.Printf("Open user DB error: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "连接用户数据库失败"})
@@ -1076,7 +1076,7 @@ func deleteShiftAssignmentHandler(c *gin.Context) {
 		return
 	}
 
-	userDb, err := sql.Open("sqlite3", userDbPath)
+	userDb, err := sql.Open("sqlite", userDbPath)
 	if err != nil {
 		log.Printf("Open user DB error: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "连接用户数据库失败"})
@@ -1127,7 +1127,7 @@ func moveShiftAssignmentHandler(c *gin.Context) {
 		return
 	}
 
-	userDb, err := sql.Open("sqlite3", userDbPath)
+	userDb, err := sql.Open("sqlite", userDbPath)
 	if err != nil {
 		log.Printf("Open user DB error: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "连接用户数据库失败"})
