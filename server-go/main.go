@@ -191,7 +191,29 @@ func addRoutes(router *gin.Engine) {
 }
 
 func initDatabase(dbPath string) (*sql.DB, error) {
-	db, err := sql.Open("sqlite", dbPath)
+	var db *sql.DB
+	var err error
+	maxRetries := 5
+
+	for i := 0; i < maxRetries; i++ {
+		db, err = sql.Open("sqlite", dbPath)
+		if err != nil {
+			if strings.Contains(err.Error(), "locked") || strings.Contains(err.Error(), "lock") {
+				log.Printf("Database locked, retrying... (%d/%d)", i+1, maxRetries)
+				time.Sleep(time.Second)
+				continue
+			}
+			return nil, err
+		}
+		break
+	}
+
+	if err != nil {
+		return nil, err
+	}
+
+	// Set busy timeout to 3000ms
+	_, err = db.Exec("PRAGMA busy_timeout = 3000")
 	if err != nil {
 		return nil, err
 	}
@@ -208,7 +230,7 @@ func initDatabase(dbPath string) (*sql.DB, error) {
 		return nil, err
 	}
 
-	log.Println("✅ Connected to database")
+	log.Println("✅ Connected to db")
 	return db, nil
 }
 

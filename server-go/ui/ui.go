@@ -38,9 +38,13 @@ func newStaticFileSystem(staticFS embed.FS) *staticFileSystem {
 	}
 }
 
-func (s *staticFileSystem) Exists(prefix string, path string) bool {
-	// This method is not used since we have the embed.FS reference
-	// We can implement this if needed by storing the FS reference
+func (s *staticFileSystem) Exists(prefix, path string) bool {
+	f, err := s.Open(path)
+	if err != nil {
+		log.Printf("Static file does not exist")
+		return false
+	}
+	f.Close()
 	return true
 }
 
