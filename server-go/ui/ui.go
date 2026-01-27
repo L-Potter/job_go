@@ -3,6 +3,7 @@ package ui
 import (
 	"embed"
 	"io/fs"
+	"log"
 	"net/http"
 
 	"github.com/gin-gonic/contrib/static"
