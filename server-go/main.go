@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"server-go/ui"
@@ -32,7 +33,21 @@ const (
 	FRONTEND_URL = "http://localhost:5175"
 )
 
-var mainDB *sql.DB
+var mainDB *resilientDB
+
+type resilientDB struct {
+	mu         sync.RWMutex
+	db         *sql.DB
+	dbPath     string
+	maxRetries int
+	retryDelay time.Duration
+}
+
+type resilientRow struct {
+	parent *resilientDB
+	query  string
+	args   []interface{}
+}
 
 type Date struct {
 	time.Time
@@ -114,6 +129,7 @@ type ShiftAssignment struct {
 	EmployeeID string     `json:"employee_id"`
 	Date       Date       `json:"date"`
 	ShiftType  string     `json:"shift_type"`
+	Comment    string     `json:"comment"`
 	CreatedAt  *Timestamp `json:"created_at"`
 	UpdatedAt  *Timestamp `json:"updated_at"`
 }
@@ -137,7 +153,7 @@ type LeaveRecord struct {
 func main() {
 	// Initialize main database
 	var err error
-	mainDB, err = initDatabase(DB_PATH)
+	mainDB, err = newResilientDB(DB_PATH)
 	if err != nil {
 		log.Fatal("Failed to initialize database:", err)
 	}
@@ -152,6 +168,200 @@ func main() {
 
 	log.Printf("🚀 API server running on http://localhost:%d", PORT)
 	router.Run(fmt.Sprintf(":%d", PORT))
+}
+
+func newResilientDB(dbPath string) (*resilientDB, error) {
+	db, err := initDatabase(dbPath)
+	if err != nil {
+		return nil, err
+	}
+
+	return &resilientDB{
+		db:         db,
+		dbPath:     dbPath,
+		maxRetries: 2,
+		retryDelay: 300 * time.Millisecond,
+	}, nil
+}
+
+func (r *resilientDB) Query(query string, args ...interface{}) (*sql.Rows, error) {
+	var lastErr error
+
+	for attempt := 0; attempt <= r.maxRetries; attempt++ {
+		db, err := r.currentDB()
+		if err != nil {
+			return nil, err
+		}
+
+		rows, err := db.Query(query, args...)
+		if err == nil {
+			return rows, nil
+		}
+		if !isSQLiteLockedOrBusyErr(err) {
+			return nil, err
+		}
+
+		lastErr = err
+		log.Printf("mainDB.Query locked/busy, reconnecting (%d/%d): %v", attempt+1, r.maxRetries+1, err)
+		if reconnectErr := r.reconnect(); reconnectErr != nil {
+			return nil, fmt.Errorf("%w; reconnect failed: %v", err, reconnectErr)
+		}
+		if attempt < r.maxRetries {
+			time.Sleep(r.retryDelay)
+		}
+	}
+
+	return nil, lastErr
+}
+
+func (r *resilientDB) QueryRow(query string, args ...interface{}) *resilientRow {
+	return &resilientRow{
+		parent: r,
+		query:  query,
+		args:   append([]interface{}(nil), args...),
+	}
+}
+
+func (rr *resilientRow) Scan(dest ...interface{}) error {
+	var lastErr error
+
+	for attempt := 0; attempt <= rr.parent.maxRetries; attempt++ {
+		db, err := rr.parent.currentDB()
+		if err != nil {
+			return err
+		}
+
+		err = db.QueryRow(rr.query, rr.args...).Scan(dest...)
+		if err == nil || err == sql.ErrNoRows {
+			return err
+		}
+		if !isSQLiteLockedOrBusyErr(err) {
+			return err
+		}
+
+		lastErr = err
+		log.Printf("mainDB.QueryRow locked/busy, reconnecting (%d/%d): %v", attempt+1, rr.parent.maxRetries+1, err)
+		if reconnectErr := rr.parent.reconnect(); reconnectErr != nil {
+			return fmt.Errorf("%w; reconnect failed: %v", err, reconnectErr)
+		}
+		if attempt < rr.parent.maxRetries {
+			time.Sleep(rr.parent.retryDelay)
+		}
+	}
+
+	return lastErr
+}
+
+func (r *resilientDB) Exec(query string, args ...interface{}) (sql.Result, error) {
+	var lastErr error
+
+	for attempt := 0; attempt <= r.maxRetries; attempt++ {
+		db, err := r.currentDB()
+		if err != nil {
+			return nil, err
+		}
+
+		result, err := db.Exec(query, args...)
+		if err == nil {
+			return result, nil
+		}
+		if !isSQLiteLockedOrBusyErr(err) {
+			return nil, err
+		}
+
+		lastErr = err
+		log.Printf("mainDB.Exec locked/busy, reconnecting (%d/%d): %v", attempt+1, r.maxRetries+1, err)
+		if reconnectErr := r.reconnect(); reconnectErr != nil {
+			return nil, fmt.Errorf("%w; reconnect failed: %v", err, reconnectErr)
+		}
+		if attempt < r.maxRetries {
+			time.Sleep(r.retryDelay)
+		}
+	}
+
+	return nil, lastErr
+}
+
+func (r *resilientDB) Begin() (*sql.Tx, error) {
+	var lastErr error
+
+	for attempt := 0; attempt <= r.maxRetries; attempt++ {
+		db, err := r.currentDB()
+		if err != nil {
+			return nil, err
+		}
+
+		tx, err := db.Begin()
+		if err == nil {
+			return tx, nil
+		}
+		if !isSQLiteLockedOrBusyErr(err) {
+			return nil, err
+		}
+
+		lastErr = err
+		log.Printf("mainDB.Begin locked/busy, reconnecting (%d/%d): %v", attempt+1, r.maxRetries+1, err)
+		if reconnectErr := r.reconnect(); reconnectErr != nil {
+			return nil, fmt.Errorf("%w; reconnect failed: %v", err, reconnectErr)
+		}
+		if attempt < r.maxRetries {
+			time.Sleep(r.retryDelay)
+		}
+	}
+
+	return nil, lastErr
+}
+
+func (r *resilientDB) Close() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if r.db == nil {
+		return nil
+	}
+
+	err := r.db.Close()
+	r.db = nil
+	return err
+}
+
+func (r *resilientDB) currentDB() (*sql.DB, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	if r.db == nil {
+		return nil, fmt.Errorf("database is not initialized")
+	}
+
+	return r.db, nil
+}
+
+func (r *resilientDB) reconnect() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if r.db != nil {
+		if err := r.db.Close(); err != nil {
+			log.Printf("mainDB close before reconnect failed: %v", err)
+		}
+		r.db = nil
+	}
+
+	db, err := initDatabase(r.dbPath)
+	if err != nil {
+		return err
+	}
+	r.db = db
+	return nil
+}
+
+func isSQLiteLockedOrBusyErr(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	lowerErr := strings.ToLower(err.Error())
+	return strings.Contains(lowerErr, "locked") || strings.Contains(lowerErr, "busy")
 }
 
 func addRoutes(router *gin.Engine) {
@@ -211,6 +421,10 @@ func initDatabase(dbPath string) (*sql.DB, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	// SQLite in API servers is more stable with a single writer connection.
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
 
 	// Set busy timeout to 3000ms
 	_, err = db.Exec("PRAGMA busy_timeout = 3000")
@@ -973,6 +1187,7 @@ func getShiftAssignmentsHandler(c *gin.Context) {
 			employee_id    TEXT NOT NULL,
 			date           DATE NOT NULL,
 			shift_type     TEXT NOT NULL,
+			comment        TEXT,
 			created_at     DATETIME DEFAULT CURRENT_TIMESTAMP,
 			updated_at     DATETIME DEFAULT CURRENT_TIMESTAMP,
 			PRIMARY KEY (employee_id, date)
@@ -984,7 +1199,7 @@ func getShiftAssignmentsHandler(c *gin.Context) {
 		return
 	}
 
-	rows, err := userDb.Query("SELECT employee_id, date, shift_type, created_at, updated_at FROM shift_assignments ORDER BY date")
+	rows, err := userDb.Query("SELECT employee_id, date, shift_type, comment, created_at, updated_at FROM shift_assignments ORDER BY date")
 	if err != nil {
 		log.Printf("Get shift assignments error: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "获取排班数据失败"})
@@ -995,14 +1210,16 @@ func getShiftAssignmentsHandler(c *gin.Context) {
 	var assignments []ShiftAssignment
 	for rows.Next() {
 		var assignment ShiftAssignment
+		var comment sql.NullString
 		var createdAt, updatedAt sql.NullTime
 
-		err := rows.Scan(&assignment.EmployeeID, &assignment.Date, &assignment.ShiftType, &createdAt, &updatedAt)
+		err := rows.Scan(&assignment.EmployeeID, &assignment.Date, &assignment.ShiftType, &comment, &createdAt, &updatedAt)
 		if err != nil {
 			log.Printf("Scan shift assignment error: %v", err)
 			continue
 		}
 
+		assignment.Comment = comment.String
 		assignment.CreatedAt = nilIfZeroTimestamp(createdAt)
 		assignment.UpdatedAt = nilIfZeroTimestamp(updatedAt)
 
@@ -1018,6 +1235,7 @@ func setShiftAssignmentHandler(c *gin.Context) {
 
 	var req struct {
 		ShiftType string `json:"shift_type"`
+		Comment   string `json:"comment"`
 	}
 
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -1052,6 +1270,7 @@ func setShiftAssignmentHandler(c *gin.Context) {
 			employee_id    TEXT NOT NULL,
 			date           DATE NOT NULL,
 			shift_type     TEXT NOT NULL,
+			comment        TEXT,
 			created_at     DATETIME DEFAULT CURRENT_TIMESTAMP,
 			updated_at     DATETIME DEFAULT CURRENT_TIMESTAMP,
 			PRIMARY KEY (employee_id, date)
@@ -1065,12 +1284,13 @@ func setShiftAssignmentHandler(c *gin.Context) {
 
 	// Insert or update shift assignment
 	_, err = userDb.Exec(`
-		INSERT INTO shift_assignments (employee_id, date, shift_type)
-		VALUES (?, ?, ?)
+		INSERT INTO shift_assignments (employee_id, date, shift_type, comment)
+		VALUES (?, ?, ?, ?)
 		ON CONFLICT(employee_id, date) DO UPDATE SET
 			shift_type = excluded.shift_type,
+			comment = excluded.comment,
 			updated_at = CURRENT_TIMESTAMP
-	`, employeeID, date, req.ShiftType)
+	`, employeeID, date, req.ShiftType, req.Comment)
 
 	if err != nil {
 		log.Printf("Save shift assignment error: %v", err)
@@ -1082,6 +1302,7 @@ func setShiftAssignmentHandler(c *gin.Context) {
 		"employee_id": employeeID,
 		"date":        date,
 		"shift_type":  req.ShiftType,
+		"comment":     req.Comment,
 		"message":     "排班保存成功",
 	})
 }

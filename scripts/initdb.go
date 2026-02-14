@@ -12,7 +12,7 @@ import (
 	"path/filepath"
 	"runtime"
 
-	_ "modernc.org/sqlite"
+	_ "github.com/mattn/go-sqlite3"
 )
 
 const (
@@ -33,7 +33,7 @@ func main() {
 	fmt.Println("📦 Initializing database...")
 
 	// Create database connection
-	db, err := sql.Open("sqlite", dbPath)
+	db, err := sql.Open("sqlite3", dbPath)
 	if err != nil {
 		log.Fatalf("❌ Failed to connect to database: %v", err)
 	}
@@ -125,7 +125,7 @@ func createTables(db *sql.DB) error {
 			shift_type    TEXT CHECK(shift_type IN ('A', 'B')),
 			site          TEXT CHECK(site IN ('P1', 'P2', 'P3', 'P4')),
 			password_hash TEXT NOT NULL,
-			role          TEXT DEFAULT 'user' CHECK(role IN ('user', 'admin')),
+			role          TEXT DEFAULT 'user' CHECK(role IN ('user', 'manager', 'admin')),
 			created_at    DATETIME DEFAULT CURRENT_TIMESTAMP,
 			day_night     TEXT CHECK(day_night IN ('D', 'N'))
 		)`
@@ -145,7 +145,7 @@ func insertDefaultData(db *sql.DB) error {
 	if err != nil {
 		return fmt.Errorf("failed to insert admin user: %w", err)
 	}
-	fmt.Println("✅ Created admin user: admin (password: 663955)")
+	fmt.Println("✅ Created admin user: admin (password: admin)")
 
 	// Insert default leave types
 	err = insertDefaultLeaveTypes(db)
