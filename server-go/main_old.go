@@ -113,7 +113,6 @@ type User struct {
 	Site         *string    `json:"site"`
 	DayNight     *string    `json:"day_night"`
 	Role         string     `json:"role"`
-	Group        string     `json:"group"`
 	PasswordHash string     `json:"-"`
 	CreatedAt    *Timestamp `json:"created_at"`
 }
@@ -461,7 +460,6 @@ func createTables(db *sql.DB) error {
 		site           TEXT,
 		day_night      TEXT,
 		role           TEXT DEFAULT 'user',
-		"group"        TEXT NOT NULL DEFAULT '',
 		created_at     DATETIME DEFAULT CURRENT_TIMESTAMP
 	)`
 
@@ -525,11 +523,11 @@ func loginHandler(c *gin.Context) {
 	var createdAt sql.NullTime
 
 	err := mainDB.QueryRow(`
-		SELECT user_id, name, employee_id, shift_type, site, day_night, role, "group", created_at
+		SELECT user_id, name, employee_id, shift_type, site, day_night, role, created_at
 		FROM users WHERE employee_id = ?
 	`, req.EmployeeID).Scan(
 		&user.UserID, &user.Name, &user.EmployeeID,
-		&shiftType, &site, &dayNight, &user.Role, &user.Group, &createdAt,
+		&shiftType, &site, &dayNight, &user.Role, &createdAt,
 	)
 
 	if err == sql.ErrNoRows {
@@ -569,7 +567,7 @@ func logoutHandler(c *gin.Context) {
 
 func getUsersHandler(c *gin.Context) {
 	rows, err := mainDB.Query(`
-		SELECT user_id, name, employee_id, shift_type, site, day_night, role, "group", created_at
+		SELECT user_id, name, employee_id, shift_type, site, day_night, role, created_at
 		FROM users ORDER BY created_at DESC
 	`)
 	if err != nil {
@@ -587,7 +585,7 @@ func getUsersHandler(c *gin.Context) {
 
 		err := rows.Scan(
 			&user.UserID, &user.Name, &user.EmployeeID,
-			&shiftType, &site, &dayNight, &user.Role, &user.Group, &createdAt,
+			&shiftType, &site, &dayNight, &user.Role, &createdAt,
 		)
 		if err != nil {
 			log.Printf("Scan user error: %v", err)
@@ -613,11 +611,11 @@ func getUserHandler(c *gin.Context) {
 	var createdAt sql.NullTime
 
 	err := mainDB.QueryRow(`
-		SELECT user_id, name, employee_id, shift_type, site, day_night, role, "group", created_at
+		SELECT user_id, name, employee_id, shift_type, site, day_night, role, created_at
 		FROM users WHERE user_id = ?
 	`, userID).Scan(
 		&user.UserID, &user.Name, &user.EmployeeID,
-		&shiftType, &site, &dayNight, &user.Role, &user.Group, &createdAt,
+		&shiftType, &site, &dayNight, &user.Role, &createdAt,
 	)
 
 	if err == sql.ErrNoRows {
@@ -646,7 +644,6 @@ func createUserHandler(c *gin.Context) {
 		Site       *string `json:"site"`
 		DayNight   *string `json:"day_night"`
 		Role       string  `json:"role"`
-		Group      string  `json:"group"`
 	}
 
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -679,9 +676,9 @@ func createUserHandler(c *gin.Context) {
 	passwordHash := hashPassword(req.Password)
 
 	result, err := mainDB.Exec(`
-		INSERT INTO users (name, employee_id, password_hash, shift_type, site, day_night, role, "group")
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-	`, req.Name, req.EmployeeID, passwordHash, req.ShiftType, req.Site, req.DayNight, role, req.Group)
+		INSERT INTO users (name, employee_id, password_hash, shift_type, site, day_night, role)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
+	`, req.Name, req.EmployeeID, passwordHash, req.ShiftType, req.Site, req.DayNight, role)
 
 	if err != nil {
 		log.Printf("Create user error: %v", err)
@@ -734,7 +731,6 @@ func createUserHandler(c *gin.Context) {
 		"site":        req.Site,
 		"day_night":   req.DayNight,
 		"role":        role,
-		"group":       req.Group,
 	}
 
 	c.JSON(http.StatusCreated, response)
@@ -750,7 +746,6 @@ func updateUserHandler(c *gin.Context) {
 		Site       *string `json:"site"`
 		DayNight   *string `json:"day_night"`
 		Role       string  `json:"role"`
-		Group      *string `json:"group"`
 		Password   string  `json:"password"`
 	}
 
@@ -816,10 +811,6 @@ func updateUserHandler(c *gin.Context) {
 	if req.Role != "" {
 		setParts = append(setParts, "role = ?")
 		args = append(args, req.Role)
-	}
-	if req.Group != nil {
-		setParts = append(setParts, "\"group\" = ?")
-		args = append(args, *req.Group)
 	}
 
 	if len(setParts) == 0 {

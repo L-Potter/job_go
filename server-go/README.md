@@ -1,3 +1,7 @@
+> sqlite3 database.db 'ALTER TABLE users ADD COLUMN "group" TEXT NOT NULL DEFAULT "";'
+
+main.go -> gin 變更為生產模式 跟 會自動開啟瀏覽器
+
 # Job Shift Management Go Backend Server
 
 This is the Go backend server for the Job Shift Management web application. It provides REST API endpoints for managing employees, shifts, leave records, and calendar tags using SQLite database.
