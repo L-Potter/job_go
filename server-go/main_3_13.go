@@ -485,18 +485,7 @@ func createTables(db *sql.DB) error {
 		created_at     DATETIME DEFAULT CURRENT_TIMESTAMP
 	)`
 
-	// Admin log table
-	adminLogTable := `
-	CREATE TABLE IF NOT EXISTS admin_log (
-		log_id         INTEGER PRIMARY KEY AUTOINCREMENT,
-		action         TEXT NOT NULL,
-		table_name     TEXT NOT NULL,
-		record_id      TEXT NOT NULL,
-		details        TEXT,
-		created_at     DATETIME DEFAULT CURRENT_TIMESTAMP
-	)`
-
-	tables := []string{usersTable, calendarTagsTable, leaveTypesTable, adminLogTable}
+	tables := []string{usersTable, calendarTagsTable, leaveTypesTable}
 	for _, table := range tables {
 		_, err := db.Exec(table)
 		if err != nil {
@@ -701,10 +690,18 @@ func createUserHandler(c *gin.Context) {
 	}
 
 	userID, _ := result.LastInsertId()
-	logAdminAction("CREATE", "users", req.EmployeeID, fmt.Sprintf("Created user: %s (Role: %s)", req.Name, role))
 
 	// Create user-specific database file
 	userDbPath := filepath.Join("..", fmt.Sprintf("%s.db", req.EmployeeID))
+
+	// Set hidden attribute on Windows
+	if runtime.GOOS == "windows" {
+		cmd := exec.Command("attrib", "+h", userDbPath)
+		err := cmd.Run()
+		if err != nil {
+			log.Printf("Failed to set hidden attribute on user DB: %v", err)
+		}
+	}
 
 	userDb, err := sql.Open("sqlite", userDbPath)
 	if err != nil {
@@ -713,7 +710,7 @@ func createUserHandler(c *gin.Context) {
 	} else {
 		// Create leave_records table
 		_, err = userDb.Exec(`
-			CREATE TABLE IF NOT EXISTS leave_records (
+			CREATE TABLE leave_records (
 				user_id        INTEGER NOT NULL,
 				leave_type_id  INTEGER NOT NULL,
 				date           DATE NOT NULL,
@@ -723,32 +720,10 @@ func createUserHandler(c *gin.Context) {
 		`)
 		if err != nil {
 			log.Printf("Create leave_records table error: %v", err)
-		}
-
-		// Create user_log table
-		_, err = userDb.Exec(`
-			CREATE TABLE IF NOT EXISTS user_log (
-				log_id INTEGER PRIMARY KEY AUTOINCREMENT,
-				action TEXT NOT NULL,
-				table_name TEXT NOT NULL,
-				record_id TEXT NOT NULL,
-				details TEXT,
-				created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-			)
-		`)
-		if err != nil {
-			log.Printf("Create user_log table error: %v", err)
 		} else {
-			log.Printf("✅ User database and tables created: %s.db", req.EmployeeID)
+			log.Printf("✅ User database and table created: %s.db", req.EmployeeID)
 		}
 		userDb.Close()
-	}
-
-	// Set hidden attribute on Windows
-	cmd := exec.Command("attrib", "+h", userDbPath)
-	err := cmd.Run()
-	if err != nil {
-		log.Printf("Failed to set hidden attribute on user DB: %v", err)
 	}
 
 	response := map[string]interface{}{
@@ -863,9 +838,6 @@ func updateUserHandler(c *gin.Context) {
 	}
 
 	rowsAffected, _ := result.RowsAffected()
-	if rowsAffected > 0 {
-		logAdminAction("UPDATE", "users", userID, "Updated user details")
-	}
 	c.JSON(http.StatusOK, gin.H{
 		"message": "用户更新成功",
 		"changes": rowsAffected,
@@ -900,7 +872,6 @@ func deleteUserHandler(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "用户不存在"})
 		return
 	}
-	logAdminAction("DELETE", "users", employeeID, "Deleted user")
 
 	// Delete user-specific database file
 	userDbPath := filepath.Join("..", fmt.Sprintf("%s.db", employeeID))
@@ -912,28 +883,6 @@ func deleteUserHandler(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{"message": "用户删除成功"})
-}
-
-// ==================== Logging Helpers ====================
-
-func logAdminAction(action string, tableName string, recordID string, details string) {
-	_, err := mainDB.Exec(`
-		INSERT INTO admin_log (action, table_name, record_id, details)
-		VALUES (?, ?, ?, ?)
-	`, action, tableName, recordID, details)
-	if err != nil {
-		log.Printf("Failed to log admin action: %v", err)
-	}
-}
-
-func logUserAction(userDb *sql.DB, action string, tableName string, recordID string, details string) {
-	_, err := userDb.Exec(`
-		INSERT INTO user_log (action, table_name, record_id, details)
-		VALUES (?, ?, ?, ?)
-	`, action, tableName, recordID, details)
-	if err != nil {
-		log.Printf("Failed to log user action: %v", err)
-	}
 }
 
 // ==================== Utility Functions ====================
@@ -1082,7 +1031,6 @@ func setCalendarTagHandler(c *gin.Context) {
 			"message": "日历标签创建成功",
 			"date":    date,
 		})
-		logAdminAction("CREATE", "calendar_tags", date, fmt.Sprintf("Holiday: %v, Shift: %v", isHoliday, req.ShiftType))
 	} else if err != nil {
 		log.Printf("Check calendar tag exists error: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "检查日期失败"})
@@ -1124,12 +1072,6 @@ func setCalendarTagHandler(c *gin.Context) {
 			"message": "日历标签更新成功",
 			"date":    date,
 		})
-
-		shiftVal := "null"
-		if req.ShiftType != nil {
-			shiftVal = *req.ShiftType
-		}
-		logAdminAction("UPDATE", "calendar_tags", date, fmt.Sprintf("Holiday: %v, Shift: %v", req.IsHoliday, shiftVal))
 	}
 }
 
@@ -1148,7 +1090,6 @@ func deleteCalendarTagHandler(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "日历标签不存在"})
 		return
 	}
-	logAdminAction("DELETE", "calendar_tags", date, "Deleted calendar tag")
 
 	c.JSON(http.StatusOK, gin.H{"message": "日历标签删除成功"})
 }
@@ -1222,15 +1163,11 @@ func batchCalendarTagsHandler(c *gin.Context) {
 			"success": successCount,
 			"total":   len(req.Tags),
 		})
-		if successCount > 0 {
-			logAdminAction("BATCH_UPDATE", "calendar_tags", "batch", fmt.Sprintf("Successfully batch updated %d tags out of %d", successCount, len(req.Tags)))
-		}
 	} else {
 		c.JSON(http.StatusOK, gin.H{
 			"message": "批量操作成功",
 			"count":   successCount,
 		})
-		logAdminAction("BATCH_UPDATE", "calendar_tags", "batch", fmt.Sprintf("Successfully batch updated all %d tags", successCount))
 	}
 }
 
@@ -1269,21 +1206,6 @@ func getShiftAssignmentsHandler(c *gin.Context) {
 		log.Printf("Create shift_assignments table error: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "创建表失败"})
 		return
-	}
-
-	// Ensure user_log table exists
-	_, err = userDb.Exec(`
-		CREATE TABLE IF NOT EXISTS user_log (
-			log_id INTEGER PRIMARY KEY AUTOINCREMENT,
-			action TEXT NOT NULL,
-			table_name TEXT NOT NULL,
-			record_id TEXT NOT NULL,
-			details TEXT,
-			created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-		)
-	`)
-	if err != nil {
-		log.Printf("Create user_log table error: %v", err)
 	}
 
 	rows, err := userDb.Query("SELECT employee_id, date, shift_type, comment, created_at, updated_at FROM shift_assignments ORDER BY date")
@@ -1369,21 +1291,6 @@ func setShiftAssignmentHandler(c *gin.Context) {
 		return
 	}
 
-	// Ensure user_log table exists
-	_, err = userDb.Exec(`
-		CREATE TABLE IF NOT EXISTS user_log (
-			log_id INTEGER PRIMARY KEY AUTOINCREMENT,
-			action TEXT NOT NULL,
-			table_name TEXT NOT NULL,
-			record_id TEXT NOT NULL,
-			details TEXT,
-			created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-		)
-	`)
-	if err != nil {
-		log.Printf("Create user_log table error: %v", err)
-	}
-
 	// Insert or update shift assignment
 	_, err = userDb.Exec(`
 		INSERT INTO shift_assignments (employee_id, date, shift_type, comment)
@@ -1407,8 +1314,6 @@ func setShiftAssignmentHandler(c *gin.Context) {
 		"comment":     req.Comment,
 		"message":     "排班保存成功",
 	})
-
-	logUserAction(userDb, "UPSERT", "shift_assignments", date, fmt.Sprintf("Shift: %s, Comment: %s", req.ShiftType, req.Comment))
 }
 
 func deleteShiftAssignmentHandler(c *gin.Context) {
@@ -1445,7 +1350,6 @@ func deleteShiftAssignmentHandler(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{"message": "排班删除成功"})
-	logUserAction(userDb, "DELETE", "shift_assignments", date, "Deleted shift assignment")
 }
 
 func moveShiftAssignmentHandler(c *gin.Context) {
@@ -1538,7 +1442,6 @@ func moveShiftAssignmentHandler(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{"message": "排班移动成功"})
-	logUserAction(userDb, "MOVE_FROM", "shift_assignments", req.FromDate, fmt.Sprintf("Moved to %s %s", req.ToEmployeeID, req.ToDate))
 }
 
 func getLeaveTypesHandler(c *gin.Context) {
@@ -1666,7 +1569,6 @@ func createLeaveTypeHandler(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusCreated, response)
-	logAdminAction("CREATE", "leave_types", fmt.Sprintf("%d", leaveID), fmt.Sprintf("Created leave type: %s", req.Name))
 }
 
 func updateLeaveTypeHandler(c *gin.Context) {
@@ -1746,9 +1648,6 @@ func updateLeaveTypeHandler(c *gin.Context) {
 	}
 
 	rowsAffected, _ := result.RowsAffected()
-	if rowsAffected > 0 {
-		logAdminAction("UPDATE", "leave_types", fmt.Sprintf("%v", leaveID), fmt.Sprintf("Updated leave type: %s", req.Name))
-	}
 	c.JSON(http.StatusOK, gin.H{
 		"message": "请假类型更新成功",
 		"changes": rowsAffected,
@@ -1770,7 +1669,6 @@ func deleteLeaveTypeHandler(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "请假类型不存在"})
 		return
 	}
-	logAdminAction("DELETE", "leave_types", fmt.Sprintf("%v", leaveID), "Deleted leave type")
 
 	c.JSON(http.StatusOK, gin.H{"message": "请假类型删除成功"})
 }
