@@ -12,7 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"sort"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -141,16 +141,6 @@ type LeaveType struct {
 	IsNotWorkday int        `json:"is_not_workday"`
 	Color        string     `json:"color"`
 	CreatedAt    *Timestamp `json:"created_at"`
-}
-
-type LogEntry struct {
-	LogID      int        `json:"log_id"`
-	User       string     `json:"user"`
-	Action     string     `json:"action"`
-	TableName  string     `json:"table_name"`
-	RecordID   string     `json:"record_id"`
-	Details    string     `json:"details"`
-	CreatedAt  *Timestamp `json:"created_at"`
 }
 
 type LeaveRecord struct {
@@ -381,9 +371,6 @@ func addRoutes(router *gin.Engine) {
 		// Auth routes
 		api.POST("/login", loginHandler)
 		api.POST("/logout", logoutHandler)
-		api.GET("/ping", func(c *gin.Context) {
-			c.JSON(http.StatusOK, gin.H{"status": "ok"})
-		})
 
 		// User routes
 		api.GET("/users", getUsersHandler)
@@ -411,9 +398,6 @@ func addRoutes(router *gin.Engine) {
 		api.POST("/leave-types", createLeaveTypeHandler)
 		api.PUT("/leave-types/:id", updateLeaveTypeHandler)
 		api.DELETE("/leave-types/:id", deleteLeaveTypeHandler)
-
-		// Admin log routes
-		api.GET("/logs", getLogsHandler)
 	}
 }
 
@@ -762,7 +746,7 @@ func createUserHandler(c *gin.Context) {
 
 	// Set hidden attribute on Windows
 	cmd := exec.Command("attrib", "+h", userDbPath)
-	err = cmd.Run()
+	err := cmd.Run()
 	if err != nil {
 		log.Printf("Failed to set hidden attribute on user DB: %v", err)
 	}
@@ -1789,84 +1773,4 @@ func deleteLeaveTypeHandler(c *gin.Context) {
 	logAdminAction("DELETE", "leave_types", fmt.Sprintf("%v", leaveID), "Deleted leave type")
 
 	c.JSON(http.StatusOK, gin.H{"message": "请假类型删除成功"})
-}
-
-func getLogsHandler(c *gin.Context) {
-	var allLogs []LogEntry
-
-	// 1. Get Admin Logs
-	adminRows, err := mainDB.Query(`
-		SELECT log_id, action, table_name, record_id, details, created_at 
-		FROM admin_log
-	`)
-	if err != nil {
-		log.Printf("Get admin logs error: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "获取系统日志失败"})
-		return
-	}
-	defer adminRows.Close()
-
-	for adminRows.Next() {
-		var l LogEntry
-		var created sql.NullTime
-		var details sql.NullString
-		err := adminRows.Scan(&l.LogID, &l.Action, &l.TableName, &l.RecordID, &details, &created)
-		if err == nil {
-			l.User = "System Admin"
-			l.Details = details.String
-			l.CreatedAt = nilIfZeroTimestamp(created)
-			allLogs = append(allLogs, l)
-		}
-	}
-
-	// 2. Get User Logs
-	userRows, err := mainDB.Query("SELECT employee_id, name FROM users")
-	if err == nil {
-		defer userRows.Close()
-		for userRows.Next() {
-			var empID string
-			var empName string
-			if err := userRows.Scan(&empID, &empName); err == nil {
-				userDbPath := filepath.Join("..", fmt.Sprintf("%s.db", empID))
-				if _, err := os.Stat(userDbPath); err == nil {
-					userDb, err := sql.Open("sqlite", userDbPath)
-					if err == nil {
-						uRows, err := userDb.Query(`
-							SELECT log_id, action, table_name, record_id, details, created_at
-							FROM user_log
-						`)
-						if err == nil {
-							for uRows.Next() {
-								var l LogEntry
-								var created sql.NullTime
-								var details sql.NullString
-								err := uRows.Scan(&l.LogID, &l.Action, &l.TableName, &l.RecordID, &details, &created)
-								if err == nil {
-									l.User = fmt.Sprintf("%s (%s)", empName, empID)
-									l.Details = details.String
-									l.CreatedAt = nilIfZeroTimestamp(created)
-									allLogs = append(allLogs, l)
-								}
-							}
-							uRows.Close()
-						}
-						userDb.Close()
-					}
-				}
-			}
-		}
-	}
-
-	// Sorting logs manually by CreatedAt descending
-	sort.Slice(allLogs, func(i, j int) bool {
-		if allLogs[i].CreatedAt == nil {
-			return false
-		}
-		if allLogs[j].CreatedAt == nil {
-			return true
-		}
-		return allLogs[i].CreatedAt.Time.After(allLogs[j].CreatedAt.Time)
-	})
-
-	c.JSON(http.StatusOK, allLogs)
 }

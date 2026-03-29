@@ -1,6 +1,26 @@
 > sqlite3 database.db 'ALTER TABLE users ADD COLUMN "group" TEXT NOT NULL DEFAULT "";'
 
-main.go -> gin 變更為生產模式 跟 會自動開啟瀏覽器
+main.go -> gin 變更為生產模式 跟 會url 自動開啟瀏覽器
+npm install react-data-grid
+npm install react-data-grid --legacy-peer-deps
+npm install react-data-grid@7.0.0-beta.44 --save
+
+ 我將 react-data-grid 降版到了 7.0.0-beta.44（這版對於 React 18 的支援較為對齊與穩定），並同時修復了預設的 import DataGrid from 'react-data-grid' 語法。
+這兩個錯誤是由於版本降級以及 Vite 的快取所導致的組合技：
+
+rm -rf node_modules/.vite
+
+
+
+react-data-grid 版本 beta.59 需要 React 19（這也是為什麼一開始會跳 Rendering <Context> directly is not supported 的錯，因為 React 18 不支援）。
+在降版回到支援 React 18 的 beta.44 後，他的載入方式又只接受具名匯入 import { DataGrid } from 'react-data-grid' 而非 default。
+同時 Vite 伺服器會將 node_modules 快取在 .vite/deps 資料夾中，沒有即時反映依賴變更。
+我做了什麼修復： 我已经將 
+
+src/components/LogViewer.tsx
+ 的程式碼改回 import { DataGrid }，並且清除了原本的 .vite 依賴快取 (rm -rf node_modules/.vite)。
+
+現在請您 重新啟動前端的 Vite 伺服器 (npm run dev)，這些元件和型別錯誤都不會再出現了！可以直接前往「系統日誌」頁面查看。
 
 # Job Shift Management Go Backend Server
 
