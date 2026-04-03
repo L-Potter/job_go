@@ -1,0 +1,1 @@
+cd /Users/linchung/Desktop/cluade/scripts/migrate_overtime_shift && CGO_ENABLED=1 go build -o /dev/null . 2>&1
