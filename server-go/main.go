@@ -109,16 +109,17 @@ func (t *Timestamp) Scan(value interface{}) error {
 }
 
 type User struct {
-	UserID       int        `json:"user_id"`
-	Name         string     `json:"name"`
-	EmployeeID   string     `json:"employee_id"`
-	ShiftType    *string    `json:"shift_type"`
-	Site         *string    `json:"site"`
-	DayNight     *string    `json:"day_night"`
-	Role         string     `json:"role"`
-	Group        string     `json:"group"`
-	PasswordHash string     `json:"-"`
-	CreatedAt    *Timestamp `json:"created_at"`
+	UserID                   int        `json:"user_id"`
+	Name                     string     `json:"name"`
+	EmployeeID               string     `json:"employee_id"`
+	ShiftType                *string    `json:"shift_type"`
+	Site                     *string    `json:"site"`
+	DayNight                 *string    `json:"day_night"`
+	Role                     string     `json:"role"`
+	Group                    string     `json:"group"`
+	MonthlyOvertimeCapHours  *int       `json:"monthly_overtime_cap_hours"`
+	PasswordHash             string     `json:"-"`
+	CreatedAt                *Timestamp `json:"created_at"`
 	// 僅登入回應：供 admin/manager 呼叫待審註冊 API（Bearer），不來自資料庫欄位
 	SessionToken string `json:"session_token,omitempty"`
 }
@@ -623,8 +624,9 @@ func createTables(db *sql.DB) error {
 		site           TEXT,
 		day_night      TEXT,
 		role           TEXT DEFAULT 'user',
-		"group"        TEXT NOT NULL DEFAULT '',
-		created_at     DATETIME DEFAULT CURRENT_TIMESTAMP
+		"group"                       TEXT NOT NULL DEFAULT '',
+		monthly_overtime_cap_hours    INTEGER,
+		created_at                    DATETIME DEFAULT CURRENT_TIMESTAMP
 	)`
 
 	// Calendar tags table
@@ -674,6 +676,13 @@ func createTables(db *sql.DB) error {
 		_, err := db.Exec(table)
 		if err != nil {
 			return err
+		}
+	}
+
+	if _, err := db.Exec(`ALTER TABLE users ADD COLUMN monthly_overtime_cap_hours INTEGER`); err != nil {
+		low := strings.ToLower(err.Error())
+		if !strings.Contains(low, "duplicate") && !strings.Contains(low, "already exists") {
+			log.Printf("migrate users.monthly_overtime_cap_hours: %v", err)
 		}
 	}
 
@@ -746,14 +755,15 @@ func loginHandler(c *gin.Context) {
 
 	var user User
 	var shiftType, site, dayNight sql.NullString
+	var monthlyCap sql.NullInt64
 	var createdAt sql.NullTime
 
 	err := mainDB.QueryRow(`
-		SELECT user_id, name, employee_id, shift_type, site, day_night, role, "group", created_at
+		SELECT user_id, name, employee_id, shift_type, site, day_night, role, "group", monthly_overtime_cap_hours, created_at
 		FROM users WHERE employee_id = ?
 	`, req.EmployeeID).Scan(
 		&user.UserID, &user.Name, &user.EmployeeID,
-		&shiftType, &site, &dayNight, &user.Role, &user.Group, &createdAt,
+		&shiftType, &site, &dayNight, &user.Role, &user.Group, &monthlyCap, &createdAt,
 	)
 
 	if err == sql.ErrNoRows {
@@ -782,6 +792,7 @@ func loginHandler(c *gin.Context) {
 	user.ShiftType = nilIfEmpty(shiftType)
 	user.Site = nilIfEmpty(site)
 	user.DayNight = nilIfEmpty(dayNight)
+	user.MonthlyOvertimeCapHours = intPtrFromNullInt64(monthlyCap)
 	user.CreatedAt = nilIfZeroTimestamp(createdAt)
 
 	if user.Role == "admin" || user.Role == "manager" {
@@ -1103,7 +1114,7 @@ func rejectUserRegistrationHandler(c *gin.Context) {
 
 func getUsersHandler(c *gin.Context) {
 	rows, err := mainDB.Query(`
-		SELECT user_id, name, employee_id, shift_type, site, day_night, role, "group", created_at
+		SELECT user_id, name, employee_id, shift_type, site, day_night, role, "group", monthly_overtime_cap_hours, created_at
 		FROM users ORDER BY created_at DESC
 	`)
 	if err != nil {
@@ -1117,11 +1128,12 @@ func getUsersHandler(c *gin.Context) {
 	for rows.Next() {
 		var user User
 		var shiftType, site, dayNight sql.NullString
+		var monthlyCap sql.NullInt64
 		var createdAt sql.NullTime
 
 		err := rows.Scan(
 			&user.UserID, &user.Name, &user.EmployeeID,
-			&shiftType, &site, &dayNight, &user.Role, &user.Group, &createdAt,
+			&shiftType, &site, &dayNight, &user.Role, &user.Group, &monthlyCap, &createdAt,
 		)
 		if err != nil {
 			log.Printf("Scan user error: %v", err)
@@ -1131,6 +1143,7 @@ func getUsersHandler(c *gin.Context) {
 		user.ShiftType = nilIfEmpty(shiftType)
 		user.Site = nilIfEmpty(site)
 		user.DayNight = nilIfEmpty(dayNight)
+		user.MonthlyOvertimeCapHours = intPtrFromNullInt64(monthlyCap)
 		user.CreatedAt = nilIfZeroTimestamp(createdAt)
 
 		users = append(users, user)
@@ -1146,12 +1159,13 @@ func getUserHandler(c *gin.Context) {
 	var shiftType, site, dayNight sql.NullString
 	var createdAt sql.NullTime
 
+	var monthlyCap sql.NullInt64
 	err := mainDB.QueryRow(`
-		SELECT user_id, name, employee_id, shift_type, site, day_night, role, "group", created_at
+		SELECT user_id, name, employee_id, shift_type, site, day_night, role, "group", monthly_overtime_cap_hours, created_at
 		FROM users WHERE user_id = ?
 	`, userID).Scan(
 		&user.UserID, &user.Name, &user.EmployeeID,
-		&shiftType, &site, &dayNight, &user.Role, &user.Group, &createdAt,
+		&shiftType, &site, &dayNight, &user.Role, &user.Group, &monthlyCap, &createdAt,
 	)
 
 	if err == sql.ErrNoRows {
@@ -1166,6 +1180,7 @@ func getUserHandler(c *gin.Context) {
 	user.ShiftType = nilIfEmpty(shiftType)
 	user.Site = nilIfEmpty(site)
 	user.DayNight = nilIfEmpty(dayNight)
+	user.MonthlyOvertimeCapHours = intPtrFromNullInt64(monthlyCap)
 	user.CreatedAt = nilIfZeroTimestamp(createdAt)
 
 	c.JSON(http.StatusOK, user)
@@ -1173,14 +1188,15 @@ func getUserHandler(c *gin.Context) {
 
 func createUserHandler(c *gin.Context) {
 	var req struct {
-		Name       string  `json:"name"`
-		EmployeeID string  `json:"employee_id"`
-		Password   string  `json:"password"`
-		ShiftType  *string `json:"shift_type"`
-		Site       *string `json:"site"`
-		DayNight   *string `json:"day_night"`
-		Role       string  `json:"role"`
-		Group      string  `json:"group"`
+		Name                     string  `json:"name"`
+		EmployeeID               string  `json:"employee_id"`
+		Password                 string  `json:"password"`
+		ShiftType                *string `json:"shift_type"`
+		Site                     *string `json:"site"`
+		DayNight                 *string `json:"day_night"`
+		Role                     string  `json:"role"`
+		Group                    string  `json:"group"`
+		MonthlyOvertimeCapHours  *int    `json:"monthly_overtime_cap_hours"`
 	}
 
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -1212,10 +1228,19 @@ func createUserHandler(c *gin.Context) {
 
 	passwordHash := hashPassword(req.Password)
 
+	var cap interface{}
+	if req.MonthlyOvertimeCapHours != nil {
+		if *req.MonthlyOvertimeCapHours < 0 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "monthly_overtime_cap_hours 不可為負數"})
+			return
+		}
+		cap = *req.MonthlyOvertimeCapHours
+	}
+
 	result, err := mainDB.Exec(`
-		INSERT INTO users (name, employee_id, password_hash, shift_type, site, day_night, role, "group")
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-	`, req.Name, req.EmployeeID, passwordHash, req.ShiftType, req.Site, req.DayNight, role, req.Group)
+		INSERT INTO users (name, employee_id, password_hash, shift_type, site, day_night, role, "group", monthly_overtime_cap_hours)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, req.Name, req.EmployeeID, passwordHash, req.ShiftType, req.Site, req.DayNight, role, req.Group, cap)
 
 	if err != nil {
 		log.Printf("Create user error: %v", err)
@@ -1240,6 +1265,11 @@ func createUserHandler(c *gin.Context) {
 		"role":        role,
 		"group":       req.Group,
 	}
+	if req.MonthlyOvertimeCapHours != nil {
+		response["monthly_overtime_cap_hours"] = *req.MonthlyOvertimeCapHours
+	} else {
+		response["monthly_overtime_cap_hours"] = nil
+	}
 
 	c.JSON(http.StatusCreated, response)
 }
@@ -1248,14 +1278,16 @@ func updateUserHandler(c *gin.Context) {
 	userID := c.Param("id")
 
 	var req struct {
-		Name       string  `json:"name"`
-		EmployeeID string  `json:"employee_id"`
-		ShiftType  *string `json:"shift_type"`
-		Site       *string `json:"site"`
-		DayNight   *string `json:"day_night"`
-		Role       string  `json:"role"`
-		Group      *string `json:"group"`
-		Password   string  `json:"password"`
+		Name                     string  `json:"name"`
+		EmployeeID               string  `json:"employee_id"`
+		ShiftType                *string `json:"shift_type"`
+		Site                     *string `json:"site"`
+		DayNight                 *string `json:"day_night"`
+		Role                     string  `json:"role"`
+		Group                    *string `json:"group"`
+		Password                 string  `json:"password"`
+		MonthlyOvertimeCapHours  *int    `json:"monthly_overtime_cap_hours"`
+		ClearMonthlyOvertimeCap  *bool   `json:"clear_monthly_overtime_cap"`
 	}
 
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -1324,6 +1356,16 @@ func updateUserHandler(c *gin.Context) {
 	if req.Group != nil {
 		setParts = append(setParts, "\"group\" = ?")
 		args = append(args, *req.Group)
+	}
+	if req.ClearMonthlyOvertimeCap != nil && *req.ClearMonthlyOvertimeCap {
+		setParts = append(setParts, "monthly_overtime_cap_hours = NULL")
+	} else if req.MonthlyOvertimeCapHours != nil {
+		if *req.MonthlyOvertimeCapHours < 0 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "monthly_overtime_cap_hours 不可為負數"})
+			return
+		}
+		setParts = append(setParts, "monthly_overtime_cap_hours = ?")
+		args = append(args, *req.MonthlyOvertimeCapHours)
 	}
 
 	if len(setParts) == 0 {
@@ -1416,6 +1458,14 @@ func logUserAction(userDb *sql.DB, action string, tableName string, recordID str
 }
 
 // ==================== Utility Functions ====================
+
+func intPtrFromNullInt64(n sql.NullInt64) *int {
+	if !n.Valid {
+		return nil
+	}
+	v := int(n.Int64)
+	return &v
+}
 
 func nilIfEmpty(ns sql.NullString) *string {
 	if ns.Valid {
