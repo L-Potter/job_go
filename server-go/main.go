@@ -1526,15 +1526,22 @@ func deleteUserHandler(c *gin.Context) {
 
 // ==================== Logging Helpers ====================
 
+// nowLocalString 以伺服器本機時區（例：Asia/Taipei）回傳 "YYYY-MM-DD HH:MM:SS" 字串。
+// SQLite 內建 CURRENT_TIMESTAMP 永遠是 UTC，會造成畫面上顯示的時間與實際操作時間差 8 小時，
+// 因此 log 寫入時一律改由 Go 端帶入本機時間字串。
+func nowLocalString() string {
+	return time.Now().Format("2006-01-02 15:04:05")
+}
+
 /**
  * 寫入 admin_log。actorEmployeeID 為實際操作者的工號（未登入或系統自動寫入請傳空字串）。
  * recordID 建議統一使用業務主鍵（例如 users 表請使用 employee_id、calendar_tags 使用日期字串）。
  */
 func logAdminActionWithActor(actorEmployeeID, action, tableName, recordID, details string) {
 	_, err := mainDB.Exec(`
-		INSERT INTO admin_log (actor_employee_id, action, table_name, record_id, details)
-		VALUES (?, ?, ?, ?, ?)
-	`, actorEmployeeID, action, tableName, recordID, details)
+		INSERT INTO admin_log (actor_employee_id, action, table_name, record_id, details, created_at)
+		VALUES (?, ?, ?, ?, ?, ?)
+	`, actorEmployeeID, action, tableName, recordID, details, nowLocalString())
 	if err != nil {
 		log.Printf("Failed to log admin action: %v", err)
 	}
@@ -1582,9 +1589,9 @@ func ensureUserLogSchema(userDb *sql.DB) {
 func logUserActionWithActor(userDb *sql.DB, actorEmployeeID, action, tableName, recordID, details string) {
 	ensureUserLogSchema(userDb)
 	_, err := userDb.Exec(`
-		INSERT INTO user_log (actor_employee_id, action, table_name, record_id, details)
-		VALUES (?, ?, ?, ?, ?)
-	`, actorEmployeeID, action, tableName, recordID, details)
+		INSERT INTO user_log (actor_employee_id, action, table_name, record_id, details, created_at)
+		VALUES (?, ?, ?, ?, ?, ?)
+	`, actorEmployeeID, action, tableName, recordID, details, nowLocalString())
 	if err != nil {
 		log.Printf("Failed to log user action: %v", err)
 	}
@@ -1748,7 +1755,13 @@ func setCalendarTagHandler(c *gin.Context) {
 			"message": "日历标签创建成功",
 			"date":    date,
 		})
-		logAdminAction("CREATE", "calendar_tags", date, fmt.Sprintf("Holiday: %v, Shift: %v", isHoliday, req.ShiftType))
+		logAdminActionWithActor(
+			actorEmployeeIDFromContext(c),
+			"CREATE",
+			"calendar_tags",
+			date,
+			fmt.Sprintf("建立行事曆標記（日期 %s，假日:%v，班別:%v）", date, isHoliday, req.ShiftType),
+		)
 	} else if err != nil {
 		log.Printf("Check calendar tag exists error: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "检查日期失败"})
@@ -1795,7 +1808,17 @@ func setCalendarTagHandler(c *gin.Context) {
 		if req.ShiftType != nil {
 			shiftVal = *req.ShiftType
 		}
-		logAdminAction("UPDATE", "calendar_tags", date, fmt.Sprintf("Holiday: %v, Shift: %v", req.IsHoliday, shiftVal))
+		holidayDesc := "未變更"
+		if req.IsHoliday != nil {
+			holidayDesc = fmt.Sprintf("%v", *req.IsHoliday)
+		}
+		logAdminActionWithActor(
+			actorEmployeeIDFromContext(c),
+			"UPDATE",
+			"calendar_tags",
+			date,
+			fmt.Sprintf("更新行事曆標記（日期 %s，假日:%s，班別:%s）", date, holidayDesc, shiftVal),
+		)
 	}
 }
 
@@ -1814,7 +1837,13 @@ func deleteCalendarTagHandler(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "日历标签不存在"})
 		return
 	}
-	logAdminAction("DELETE", "calendar_tags", date, "Deleted calendar tag")
+	logAdminActionWithActor(
+		actorEmployeeIDFromContext(c),
+		"DELETE",
+		"calendar_tags",
+		date,
+		fmt.Sprintf("刪除行事曆標記（日期 %s）", date),
+	)
 
 	c.JSON(http.StatusOK, gin.H{"message": "日历标签删除成功"})
 }
@@ -1889,14 +1918,26 @@ func batchCalendarTagsHandler(c *gin.Context) {
 			"total":   len(req.Tags),
 		})
 		if successCount > 0 {
-			logAdminAction("BATCH_UPDATE", "calendar_tags", "batch", fmt.Sprintf("Successfully batch updated %d tags out of %d", successCount, len(req.Tags)))
+			logAdminActionWithActor(
+				actorEmployeeIDFromContext(c),
+				"BATCH_UPDATE",
+				"calendar_tags",
+				"batch",
+				fmt.Sprintf("批次更新行事曆：成功 %d 筆／共 %d 筆", successCount, len(req.Tags)),
+			)
 		}
 	} else {
 		c.JSON(http.StatusOK, gin.H{
 			"message": "批量操作成功",
 			"count":   successCount,
 		})
-		logAdminAction("BATCH_UPDATE", "calendar_tags", "batch", fmt.Sprintf("Successfully batch updated all %d tags", successCount))
+		logAdminActionWithActor(
+			actorEmployeeIDFromContext(c),
+			"BATCH_UPDATE",
+			"calendar_tags",
+			"batch",
+			fmt.Sprintf("批次更新行事曆：全部成功 %d 筆", successCount),
+		)
 	}
 }
 
@@ -2050,7 +2091,7 @@ func setShiftAssignmentHandler(c *gin.Context) {
 
 	otLog := ""
 	if overtimeShift.Valid {
-		otLog = ", OT加班: " + overtimeShift.String
+		otLog = "，跨班加班:" + overtimeShift.String
 	}
 	logUserActionWithActor(
 		userDb,
@@ -2058,7 +2099,7 @@ func setShiftAssignmentHandler(c *gin.Context) {
 		"UPSERT",
 		"shift_assignments",
 		date,
-		fmt.Sprintf("Shift: %s, Comment: %s%s", req.ShiftType, req.Comment, otLog),
+		fmt.Sprintf("假別:%s，備註:%s%s", req.ShiftType, req.Comment, otLog),
 	)
 }
 
@@ -2102,7 +2143,7 @@ func deleteShiftAssignmentHandler(c *gin.Context) {
 		"DELETE",
 		"shift_assignments",
 		date,
-		"Deleted shift assignment",
+		"刪除排班",
 	)
 }
 
@@ -2208,7 +2249,7 @@ func moveShiftAssignmentHandler(c *gin.Context) {
 		"MOVE_FROM",
 		"shift_assignments",
 		req.FromDate,
-		fmt.Sprintf("Moved to %s %s", req.ToEmployeeID, req.ToDate),
+		fmt.Sprintf("搬移至 %s 的 %s", req.ToEmployeeID, req.ToDate),
 	)
 }
 
@@ -2337,7 +2378,13 @@ func createLeaveTypeHandler(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusCreated, response)
-	logAdminAction("CREATE", "leave_types", fmt.Sprintf("%d", leaveID), fmt.Sprintf("Created leave type: %s", req.Name))
+	logAdminActionWithActor(
+		actorEmployeeIDFromContext(c),
+		"CREATE",
+		"leave_types",
+		req.Name,
+		fmt.Sprintf("建立假別：%s（leave_id=%d，is_not_workday=%d，color=%s）", req.Name, leaveID, isNotWorkday, color),
+	)
 }
 
 func updateLeaveTypeHandler(c *gin.Context) {
@@ -2418,7 +2465,27 @@ func updateLeaveTypeHandler(c *gin.Context) {
 
 	rowsAffected, _ := result.RowsAffected()
 	if rowsAffected > 0 {
-		logAdminAction("UPDATE", "leave_types", fmt.Sprintf("%v", leaveID), fmt.Sprintf("Updated leave type: %s", req.Name))
+		changed := []string{}
+		if req.Name != "" {
+			changed = append(changed, fmt.Sprintf("名稱→%s", req.Name))
+		}
+		if req.IsNotWorkday != nil {
+			changed = append(changed, fmt.Sprintf("is_not_workday→%v", *req.IsNotWorkday))
+		}
+		if req.Color != "" {
+			changed = append(changed, fmt.Sprintf("color→%s", req.Color))
+		}
+		detailSummary := fmt.Sprintf("更新假別（leave_id=%s）", leaveID)
+		if len(changed) > 0 {
+			detailSummary += "；異動：" + strings.Join(changed, ", ")
+		}
+		logAdminActionWithActor(
+			actorEmployeeIDFromContext(c),
+			"UPDATE",
+			"leave_types",
+			leaveID,
+			detailSummary,
+		)
 	}
 	c.JSON(http.StatusOK, gin.H{
 		"message": "请假类型更新成功",
@@ -2441,7 +2508,13 @@ func deleteLeaveTypeHandler(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "请假类型不存在"})
 		return
 	}
-	logAdminAction("DELETE", "leave_types", fmt.Sprintf("%v", leaveID), "Deleted leave type")
+	logAdminActionWithActor(
+		actorEmployeeIDFromContext(c),
+		"DELETE",
+		"leave_types",
+		leaveID,
+		fmt.Sprintf("刪除假別（leave_id=%s）", leaveID),
+	)
 
 	c.JSON(http.StatusOK, gin.H{"message": "请假类型删除成功"})
 }

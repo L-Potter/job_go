@@ -141,8 +141,11 @@ func newRandomAPIToken() string {
 	return hex.EncodeToString(b)
 }
 
+// issueManagerSession 在成功登入後為任何角色發放 session token，
+// 以便後端可從 Authorization 取得「作用者工號」寫入 admin_log。
+// 實際的功能權限由各 API 另行以 requireAdminOrManagerAPI 判定。
 func issueManagerSession(employeeID, role string) string {
-	if role != "admin" && role != "manager" {
+	if employeeID == "" {
 		return ""
 	}
 	token := newRandomAPIToken()
@@ -652,12 +655,13 @@ func createTables(db *sql.DB) error {
 	// Admin log table
 	adminLogTable := `
 	CREATE TABLE IF NOT EXISTS admin_log (
-		log_id         INTEGER PRIMARY KEY AUTOINCREMENT,
-		action         TEXT NOT NULL,
-		table_name     TEXT NOT NULL,
-		record_id      TEXT NOT NULL,
-		details        TEXT,
-		created_at     DATETIME DEFAULT CURRENT_TIMESTAMP
+		log_id             INTEGER PRIMARY KEY AUTOINCREMENT,
+		actor_employee_id  TEXT,
+		action             TEXT NOT NULL,
+		table_name         TEXT NOT NULL,
+		record_id          TEXT NOT NULL,
+		details            TEXT,
+		created_at         DATETIME DEFAULT CURRENT_TIMESTAMP
 	)`
 
 	// 自助註冊（待 admin/manager 核准後寫入 users）
@@ -683,6 +687,13 @@ func createTables(db *sql.DB) error {
 		low := strings.ToLower(err.Error())
 		if !strings.Contains(low, "duplicate") && !strings.Contains(low, "already exists") {
 			log.Printf("migrate users.monthly_overtime_cap_hours: %v", err)
+		}
+	}
+
+	if _, err := db.Exec(`ALTER TABLE admin_log ADD COLUMN actor_employee_id TEXT`); err != nil {
+		low := strings.ToLower(err.Error())
+		if !strings.Contains(low, "duplicate") && !strings.Contains(low, "already exists") {
+			log.Printf("migrate admin_log.actor_employee_id: %v", err)
 		}
 	}
 
@@ -717,12 +728,13 @@ func createEmployeeUserDatabase(employeeID string) error {
 	}
 	if _, err := userDb.Exec(`
 		CREATE TABLE IF NOT EXISTS user_log (
-			log_id INTEGER PRIMARY KEY AUTOINCREMENT,
-			action TEXT NOT NULL,
-			table_name TEXT NOT NULL,
-			record_id TEXT NOT NULL,
-			details TEXT,
-			created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+			log_id             INTEGER PRIMARY KEY AUTOINCREMENT,
+			actor_employee_id  TEXT,
+			action             TEXT NOT NULL,
+			table_name         TEXT NOT NULL,
+			record_id          TEXT NOT NULL,
+			details            TEXT,
+			created_at         DATETIME DEFAULT CURRENT_TIMESTAMP
 		)
 	`); err != nil {
 		return fmt.Errorf("user_log: %w", err)
@@ -795,9 +807,7 @@ func loginHandler(c *gin.Context) {
 	user.MonthlyOvertimeCapHours = intPtrFromNullInt64(monthlyCap)
 	user.CreatedAt = nilIfZeroTimestamp(createdAt)
 
-	if user.Role == "admin" || user.Role == "manager" {
-		user.SessionToken = issueManagerSession(user.EmployeeID, user.Role)
-	}
+	user.SessionToken = issueManagerSession(user.EmployeeID, user.Role)
 
 	c.JSON(http.StatusOK, user)
 }
@@ -867,12 +877,14 @@ func changeOwnPasswordHandler(c *gin.Context) {
 		return
 	}
 
-	logAdminAction(
+	logAdminActionWithActor(
+		req.EmployeeID,
 		"SELF_PASSWORD_CHANGE",
 		"users",
-		strconv.Itoa(userID),
+		req.EmployeeID,
 		fmt.Sprintf("使用者自行變更密碼（工號:%s 姓名:%s）", req.EmployeeID, name),
 	)
+	_ = userID
 
 	c.JSON(http.StatusOK, gin.H{"message": "密碼已更新"})
 }
@@ -1073,7 +1085,13 @@ func approveUserRegistrationHandler(c *gin.Context) {
 		return
 	}
 
-	logAdminAction("APPROVE_REG", "user_registrations", fmt.Sprint(regID), fmt.Sprintf("Approved %s -> user_id %d", employeeID, userID))
+	logAdminActionWithActor(
+		actorEmployeeIDFromContext(c),
+		"APPROVE_REG",
+		"user_registrations",
+		employeeID,
+		fmt.Sprintf("核准註冊：%s（工號 %s，新 user_id=%d）", name, employeeID, userID),
+	)
 
 	c.JSON(http.StatusOK, gin.H{
 		"user_id":      int(userID),
@@ -1108,7 +1126,13 @@ func rejectUserRegistrationHandler(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "查無待審核申請"})
 		return
 	}
-	logAdminAction("REJECT_REG", "user_registrations", fmt.Sprint(regID), "Rejected registration")
+	logAdminActionWithActor(
+		actorEmployeeIDFromContext(c),
+		"REJECT_REG",
+		"user_registrations",
+		fmt.Sprint(regID),
+		"拒絕註冊申請",
+	)
 	c.JSON(http.StatusOK, gin.H{"message": "已拒絕該筆申請"})
 }
 
@@ -1249,7 +1273,13 @@ func createUserHandler(c *gin.Context) {
 	}
 
 	userID, _ := result.LastInsertId()
-	logAdminAction("CREATE", "users", req.EmployeeID, fmt.Sprintf("Created user: %s (Role: %s)", req.Name, role))
+	logAdminActionWithActor(
+		actorEmployeeIDFromContext(c),
+		"CREATE",
+		"users",
+		req.EmployeeID,
+		fmt.Sprintf("建立員工：%s（工號 %s，角色 %s）", req.Name, req.EmployeeID, role),
+	)
 
 	if err := createEmployeeUserDatabase(req.EmployeeID); err != nil {
 		log.Printf("Create user DB error: %v", err)
@@ -1295,9 +1325,12 @@ func updateUserHandler(c *gin.Context) {
 		return
 	}
 
-	// Check if user exists
+	// Check if user exists; also fetch current identifiers for logging
 	var existingID int
-	err := mainDB.QueryRow("SELECT user_id FROM users WHERE user_id = ?", userID).Scan(&existingID)
+	var existingEmployeeID, existingName string
+	err := mainDB.QueryRow(
+		`SELECT user_id, employee_id, name FROM users WHERE user_id = ?`, userID,
+	).Scan(&existingID, &existingEmployeeID, &existingName)
 	if err == sql.ErrNoRows {
 		c.JSON(http.StatusNotFound, gin.H{"error": "用户不存在"})
 		return
@@ -1385,7 +1418,57 @@ func updateUserHandler(c *gin.Context) {
 
 	rowsAffected, _ := result.RowsAffected()
 	if rowsAffected > 0 {
-		logAdminAction("UPDATE", "users", userID, "Updated user details")
+		actor := actorEmployeeIDFromContext(c)
+		// 以實際的 employee_id 作為 record_id（與 CREATE/DELETE 一致），新工號若有變更則以新值為主。
+		targetEmpID := existingEmployeeID
+		if req.EmployeeID != "" {
+			targetEmpID = req.EmployeeID
+		}
+		// 彙整被異動的欄位，便於稽核。
+		changed := []string{}
+		if req.Name != "" && req.Name != existingName {
+			changed = append(changed, fmt.Sprintf("姓名→%s", req.Name))
+		}
+		if req.EmployeeID != "" && req.EmployeeID != existingEmployeeID {
+			changed = append(changed, fmt.Sprintf("工號→%s", req.EmployeeID))
+		}
+		if req.ShiftType != nil {
+			changed = append(changed, fmt.Sprintf("shift_type→%s", *req.ShiftType))
+		}
+		if req.Site != nil {
+			changed = append(changed, fmt.Sprintf("site→%s", *req.Site))
+		}
+		if req.DayNight != nil {
+			changed = append(changed, fmt.Sprintf("day_night→%s", *req.DayNight))
+		}
+		if req.Role != "" {
+			changed = append(changed, fmt.Sprintf("role→%s", req.Role))
+		}
+		if req.Group != nil {
+			changed = append(changed, fmt.Sprintf("group→%s", *req.Group))
+		}
+		if req.ClearMonthlyOvertimeCap != nil && *req.ClearMonthlyOvertimeCap {
+			changed = append(changed, "monthly_overtime_cap_hours→(恢復預設)")
+		} else if req.MonthlyOvertimeCapHours != nil {
+			changed = append(changed, fmt.Sprintf("monthly_overtime_cap_hours→%d", *req.MonthlyOvertimeCapHours))
+		}
+
+		// 密碼若有變更，另外單獨記錄一筆，方便稽核。
+		if req.Password != "" {
+			logAdminActionWithActor(
+				actor,
+				"ADMIN_PASSWORD_CHANGE",
+				"users",
+				targetEmpID,
+				fmt.Sprintf("管理員變更密碼（對象工號:%s 姓名:%s）", targetEmpID, existingName),
+			)
+		}
+
+		detailSummary := fmt.Sprintf("更新員工（對象工號:%s 姓名:%s）", targetEmpID, existingName)
+		if len(changed) > 0 {
+			detailSummary += "；異動欄位：" + strings.Join(changed, ", ")
+		}
+		logAdminActionWithActor(actor, "UPDATE", "users", targetEmpID, detailSummary)
 	}
 	c.JSON(http.StatusOK, gin.H{
 		"message": "用户更新成功",
@@ -1421,7 +1504,13 @@ func deleteUserHandler(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "用户不存在"})
 		return
 	}
-	logAdminAction("DELETE", "users", employeeID, "Deleted user")
+	logAdminActionWithActor(
+		actorEmployeeIDFromContext(c),
+		"DELETE",
+		"users",
+		employeeID,
+		fmt.Sprintf("刪除員工（工號 %s）", employeeID),
+	)
 
 	// Delete user-specific database file
 	userDbPath := filepath.Join("..", fmt.Sprintf("%s.db", employeeID))
@@ -1437,24 +1526,72 @@ func deleteUserHandler(c *gin.Context) {
 
 // ==================== Logging Helpers ====================
 
-func logAdminAction(action string, tableName string, recordID string, details string) {
+/**
+ * 寫入 admin_log。actorEmployeeID 為實際操作者的工號（未登入或系統自動寫入請傳空字串）。
+ * recordID 建議統一使用業務主鍵（例如 users 表請使用 employee_id、calendar_tags 使用日期字串）。
+ */
+func logAdminActionWithActor(actorEmployeeID, action, tableName, recordID, details string) {
 	_, err := mainDB.Exec(`
-		INSERT INTO admin_log (action, table_name, record_id, details)
-		VALUES (?, ?, ?, ?)
-	`, action, tableName, recordID, details)
+		INSERT INTO admin_log (actor_employee_id, action, table_name, record_id, details)
+		VALUES (?, ?, ?, ?, ?)
+	`, actorEmployeeID, action, tableName, recordID, details)
 	if err != nil {
 		log.Printf("Failed to log admin action: %v", err)
 	}
 }
 
-func logUserAction(userDb *sql.DB, action string, tableName string, recordID string, details string) {
+func logAdminAction(action string, tableName string, recordID string, details string) {
+	logAdminActionWithActor("", action, tableName, recordID, details)
+}
+
+// actorEmployeeIDFromContext 從 Authorization bearer 對應的 managerSession 取得操作者工號。
+// 未登入或 session 無效時回傳空字串（由呼叫端自行決定是否以空字串記錄）。
+func actorEmployeeIDFromContext(c *gin.Context) string {
+	if s, ok := managerSessionFromRequest(c); ok {
+		return s.EmployeeID
+	}
+	return ""
+}
+
+// ensureUserLogSchema 確保使用者個人資料庫的 user_log 表存在，
+// 並為舊庫補上 actor_employee_id 欄位以記錄「實際操作者」。
+func ensureUserLogSchema(userDb *sql.DB) {
+	if _, err := userDb.Exec(`
+		CREATE TABLE IF NOT EXISTS user_log (
+			log_id             INTEGER PRIMARY KEY AUTOINCREMENT,
+			actor_employee_id  TEXT,
+			action             TEXT NOT NULL,
+			table_name         TEXT NOT NULL,
+			record_id          TEXT NOT NULL,
+			details            TEXT,
+			created_at         DATETIME DEFAULT CURRENT_TIMESTAMP
+		)
+	`); err != nil {
+		log.Printf("ensureUserLogSchema create: %v", err)
+	}
+	if _, err := userDb.Exec(`ALTER TABLE user_log ADD COLUMN actor_employee_id TEXT`); err != nil {
+		low := strings.ToLower(err.Error())
+		if !strings.Contains(low, "duplicate") && !strings.Contains(low, "already exists") {
+			log.Printf("ensureUserLogSchema migrate: %v", err)
+		}
+	}
+}
+
+// logUserActionWithActor 寫入個人資料庫的 user_log；actorEmployeeID 為代為填寫的實際操作者。
+// 若該個人資料庫就是當事人自己所填，actorEmployeeID 可與資料庫擁有者相同或留空。
+func logUserActionWithActor(userDb *sql.DB, actorEmployeeID, action, tableName, recordID, details string) {
+	ensureUserLogSchema(userDb)
 	_, err := userDb.Exec(`
-		INSERT INTO user_log (action, table_name, record_id, details)
-		VALUES (?, ?, ?, ?)
-	`, action, tableName, recordID, details)
+		INSERT INTO user_log (actor_employee_id, action, table_name, record_id, details)
+		VALUES (?, ?, ?, ?, ?)
+	`, actorEmployeeID, action, tableName, recordID, details)
 	if err != nil {
 		log.Printf("Failed to log user action: %v", err)
 	}
+}
+
+func logUserAction(userDb *sql.DB, action string, tableName string, recordID string, details string) {
+	logUserActionWithActor(userDb, "", action, tableName, recordID, details)
 }
 
 // ==================== Utility Functions ====================
@@ -1788,20 +1925,7 @@ func getShiftAssignmentsHandler(c *gin.Context) {
 		return
 	}
 
-	// Ensure user_log table exists
-	_, err = userDb.Exec(`
-		CREATE TABLE IF NOT EXISTS user_log (
-			log_id INTEGER PRIMARY KEY AUTOINCREMENT,
-			action TEXT NOT NULL,
-			table_name TEXT NOT NULL,
-			record_id TEXT NOT NULL,
-			details TEXT,
-			created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-		)
-	`)
-	if err != nil {
-		log.Printf("Create user_log table error: %v", err)
-	}
+	ensureUserLogSchema(userDb)
 
 	rows, err := userDb.Query("SELECT employee_id, date, shift_type, comment, overtime_shift, created_at, updated_at FROM shift_assignments ORDER BY date")
 	if err != nil {
@@ -1889,20 +2013,7 @@ func setShiftAssignmentHandler(c *gin.Context) {
 		return
 	}
 
-	// Ensure user_log table exists
-	_, err = userDb.Exec(`
-		CREATE TABLE IF NOT EXISTS user_log (
-			log_id INTEGER PRIMARY KEY AUTOINCREMENT,
-			action TEXT NOT NULL,
-			table_name TEXT NOT NULL,
-			record_id TEXT NOT NULL,
-			details TEXT,
-			created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-		)
-	`)
-	if err != nil {
-		log.Printf("Create user_log table error: %v", err)
-	}
+	ensureUserLogSchema(userDb)
 
 	now := time.Now().Format("2006-01-02 15:04:05")
 	_, err = userDb.Exec(`
@@ -1941,7 +2052,14 @@ func setShiftAssignmentHandler(c *gin.Context) {
 	if overtimeShift.Valid {
 		otLog = ", OT加班: " + overtimeShift.String
 	}
-	logUserAction(userDb, "UPSERT", "shift_assignments", date, fmt.Sprintf("Shift: %s, Comment: %s%s", req.ShiftType, req.Comment, otLog))
+	logUserActionWithActor(
+		userDb,
+		actorEmployeeIDFromContext(c),
+		"UPSERT",
+		"shift_assignments",
+		date,
+		fmt.Sprintf("Shift: %s, Comment: %s%s", req.ShiftType, req.Comment, otLog),
+	)
 }
 
 func deleteShiftAssignmentHandler(c *gin.Context) {
@@ -1978,7 +2096,14 @@ func deleteShiftAssignmentHandler(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{"message": "排班删除成功"})
-	logUserAction(userDb, "DELETE", "shift_assignments", date, "Deleted shift assignment")
+	logUserActionWithActor(
+		userDb,
+		actorEmployeeIDFromContext(c),
+		"DELETE",
+		"shift_assignments",
+		date,
+		"Deleted shift assignment",
+	)
 }
 
 func moveShiftAssignmentHandler(c *gin.Context) {
@@ -2077,7 +2202,14 @@ func moveShiftAssignmentHandler(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{"message": "排班移动成功"})
-	logUserAction(userDb, "MOVE_FROM", "shift_assignments", req.FromDate, fmt.Sprintf("Moved to %s %s", req.ToEmployeeID, req.ToDate))
+	logUserActionWithActor(
+		userDb,
+		actorEmployeeIDFromContext(c),
+		"MOVE_FROM",
+		"shift_assignments",
+		req.FromDate,
+		fmt.Sprintf("Moved to %s %s", req.ToEmployeeID, req.ToDate),
+	)
 }
 
 func getLeaveTypesHandler(c *gin.Context) {
@@ -2317,10 +2449,12 @@ func deleteLeaveTypeHandler(c *gin.Context) {
 func getLogsHandler(c *gin.Context) {
 	allLogs := make([]LogEntry, 0)
 
-	// 1. Get Admin Logs
+	// 1. Get Admin Logs（LEFT JOIN users 取得作用者姓名，actor_employee_id 為舊資料時可能為空）
 	adminRows, err := mainDB.Query(`
-		SELECT log_id, action, table_name, record_id, details, created_at 
-		FROM admin_log
+		SELECT al.log_id, al.action, al.table_name, al.record_id, al.details, al.created_at,
+		       al.actor_employee_id, u.name AS actor_name
+		FROM admin_log al
+		LEFT JOIN users u ON u.employee_id = al.actor_employee_id
 	`)
 	if err != nil {
 		log.Printf("Get admin logs error: %v", err)
@@ -2333,9 +2467,18 @@ func getLogsHandler(c *gin.Context) {
 		var l LogEntry
 		var created sql.NullTime
 		var details sql.NullString
-		err := adminRows.Scan(&l.LogID, &l.Action, &l.TableName, &l.RecordID, &details, &created)
+		var actorEmp sql.NullString
+		var actorName sql.NullString
+		err := adminRows.Scan(&l.LogID, &l.Action, &l.TableName, &l.RecordID, &details, &created, &actorEmp, &actorName)
 		if err == nil {
-			l.User = "System Admin"
+			switch {
+			case actorName.Valid && actorName.String != "" && actorEmp.Valid && actorEmp.String != "":
+				l.User = fmt.Sprintf("%s (%s)", actorName.String, actorEmp.String)
+			case actorEmp.Valid && actorEmp.String != "":
+				l.User = actorEmp.String
+			default:
+				l.User = "System Admin"
+			}
 			l.Details = details.String
 			l.CreatedAt = nilIfZeroTimestamp(created)
 			allLogs = append(allLogs, l)
@@ -2343,6 +2486,18 @@ func getLogsHandler(c *gin.Context) {
 	}
 
 	// 2. Get User Logs
+	// 先建立 employee_id → name 的索引表，供 actor 名稱查詢使用（避免多次 DB 查詢）
+	actorNameByEmpID := make(map[string]string)
+	if nameRows, err := mainDB.Query("SELECT employee_id, name FROM users"); err == nil {
+		for nameRows.Next() {
+			var empID, empName string
+			if err := nameRows.Scan(&empID, &empName); err == nil {
+				actorNameByEmpID[empID] = empName
+			}
+		}
+		nameRows.Close()
+	}
+
 	userRows, err := mainDB.Query("SELECT employee_id, name FROM users")
 	if err == nil {
 		defer userRows.Close()
@@ -2354,8 +2509,10 @@ func getLogsHandler(c *gin.Context) {
 				if _, err := os.Stat(userDbPath); err == nil {
 					userDb, err := sql.Open("sqlite", userDbPath)
 					if err == nil {
+						// 確保欄位齊全（舊庫會缺 actor_employee_id）
+						ensureUserLogSchema(userDb)
 						uRows, err := userDb.Query(`
-							SELECT log_id, action, table_name, record_id, details, created_at
+							SELECT log_id, action, table_name, record_id, details, created_at, actor_employee_id
 							FROM user_log
 						`)
 						if err == nil {
@@ -2363,10 +2520,28 @@ func getLogsHandler(c *gin.Context) {
 								var l LogEntry
 								var created sql.NullTime
 								var details sql.NullString
-								err := uRows.Scan(&l.LogID, &l.Action, &l.TableName, &l.RecordID, &details, &created)
+								var actorEmp sql.NullString
+								err := uRows.Scan(&l.LogID, &l.Action, &l.TableName, &l.RecordID, &details, &created, &actorEmp)
 								if err == nil {
-									l.User = fmt.Sprintf("%s (%s)", empName, empID)
-									l.Details = details.String
+									// 作用者：優先顯示實際操作者；舊資料無 actor 時退回 DB 擁有者
+									if actorEmp.Valid && actorEmp.String != "" {
+										if name, ok := actorNameByEmpID[actorEmp.String]; ok && name != "" {
+											l.User = fmt.Sprintf("%s (%s)", name, actorEmp.String)
+										} else {
+											l.User = actorEmp.String
+										}
+									} else {
+										l.User = fmt.Sprintf("%s (%s)", empName, empID)
+									}
+
+									// 說明：明確帶出「對象：DB 擁有者」，原 details 附在後方
+									target := fmt.Sprintf("%s (%s)", empName, empID)
+									if details.Valid && details.String != "" {
+										l.Details = fmt.Sprintf("對象 %s；%s", target, details.String)
+									} else {
+										l.Details = fmt.Sprintf("對象 %s", target)
+									}
+
 									l.CreatedAt = nilIfZeroTimestamp(created)
 									allLogs = append(allLogs, l)
 								}
