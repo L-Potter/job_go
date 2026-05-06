@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -198,6 +199,53 @@ func requireAdminOrManagerAPI(c *gin.Context) bool {
 	return true
 }
 
+func requireAdminAPI(c *gin.Context) bool {
+	s, ok := managerSessionFromRequest(c)
+	if !ok {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "請使用管理員或經理登入後取得的 session 存取此功能"})
+		return false
+	}
+	if s.Role != "admin" {
+		c.JSON(http.StatusForbidden, gin.H{"error": "僅限超級管理員"})
+		return false
+	}
+	return true
+}
+
+// safeLogOwnerEmployeeID 限制個人庫檔名（工號），避免路徑穿越。
+func safeLogOwnerEmployeeID(s string) bool {
+	if len(s) == 0 || len(s) > 64 {
+		return false
+	}
+	for _, r := range s {
+		if (r >= '0' && r <= '9') || (r >= 'A' && r <= 'Z') || (r >= 'a' && r <= 'z') || r == '-' || r == '_' {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+// parseLogCutoffTime 解析截止時間（早於此時間的日誌可刪除）；支援 HTML datetime-local、YYYY-MM-DD HH:MM:SS、僅日期。
+func parseLogCutoffTime(s string) (time.Time, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return time.Time{}, fmt.Errorf("empty")
+	}
+	s = strings.Replace(s, "T", " ", 1)
+	loc := time.Local
+	for _, layout := range []string{
+		"2006-01-02 15:04:05",
+		"2006-01-02 15:04",
+		"2006-01-02",
+	} {
+		if t, err := time.ParseInLocation(layout, s, loc); err == nil {
+			return t, nil
+		}
+	}
+	return time.Time{}, fmt.Errorf("invalid time")
+}
+
 type CalendarTag struct {
 	Date      Date    `json:"date"`
 	IsHoliday int     `json:"is_holiday"`
@@ -262,13 +310,15 @@ type LeaveType struct {
 }
 
 type LogEntry struct {
-	LogID     int        `json:"log_id"`
-	User      string     `json:"user"`
-	Action    string     `json:"action"`
-	TableName string     `json:"table_name"`
-	RecordID  string     `json:"record_id"`
-	Details   string     `json:"details"`
-	CreatedAt *Timestamp `json:"created_at"`
+	LogID           int        `json:"log_id"`
+	LogSource       string     `json:"log_source"`                  // "admin" | "user"
+	OwnerEmployeeID string     `json:"owner_employee_id,omitempty"` // user_log 所屬個人庫工號；admin_log 為空
+	User            string     `json:"user"`
+	Action          string     `json:"action"`
+	TableName       string     `json:"table_name"`
+	RecordID        string     `json:"record_id"`
+	Details         string     `json:"details"`
+	CreatedAt       *Timestamp `json:"created_at"`
 }
 
 type LeaveRecord struct {
@@ -538,6 +588,7 @@ func addRoutes(router *gin.Engine) {
 		// User routes
 		api.GET("/users", getUsersHandler)
 		api.POST("/users", createUserHandler)
+		api.POST("/users/swap-day-night", swapUsersDayNightByShiftHandler)
 		api.GET("/users/:id", getUserHandler)
 		api.PUT("/users/:id", updateUserHandler)
 		api.DELETE("/users/:id", deleteUserHandler)
@@ -562,8 +613,16 @@ func addRoutes(router *gin.Engine) {
 		api.PUT("/leave-types/:id", updateLeaveTypeHandler)
 		api.DELETE("/leave-types/:id", deleteLeaveTypeHandler)
 
+		// Leave records (per-employee DB, user_log audit)
+		api.GET("/leave-records/:employeeId", getLeaveRecordsHandler)
+		api.POST("/leave-records/:employeeId", createLeaveRecordHandler)
+		api.PUT("/leave-records/:employeeId", updateLeaveRecordHandler)
+		api.DELETE("/leave-records/:employeeId", deleteLeaveRecordHandler)
+
 		// Admin log routes
 		api.GET("/logs", getLogsHandler)
+		api.POST("/logs/batch-delete", deleteLogsBatchHandler)
+		api.POST("/logs/delete-before", deleteLogsBeforeHandler)
 	}
 }
 
@@ -671,6 +730,9 @@ func createTables(db *sql.DB) error {
 		name            TEXT NOT NULL,
 		employee_id     TEXT NOT NULL,
 		password_hash   TEXT NOT NULL,
+		shift_type      TEXT NOT NULL DEFAULT 'A',
+		site            TEXT NOT NULL DEFAULT 'P1',
+		day_night       TEXT NOT NULL DEFAULT 'D',
 		status          TEXT NOT NULL DEFAULT 'pending',
 		created_at      DATETIME DEFAULT CURRENT_TIMESTAMP
 	)`
@@ -680,6 +742,21 @@ func createTables(db *sql.DB) error {
 		_, err := db.Exec(table)
 		if err != nil {
 			return err
+		}
+	}
+
+	for _, mig := range []struct {
+		sql string
+	}{
+		{`ALTER TABLE user_registrations ADD COLUMN shift_type TEXT DEFAULT 'A'`},
+		{`ALTER TABLE user_registrations ADD COLUMN site TEXT DEFAULT 'P1'`},
+		{`ALTER TABLE user_registrations ADD COLUMN day_night TEXT DEFAULT 'D'`},
+	} {
+		if _, err := db.Exec(mig.sql); err != nil {
+			low := strings.ToLower(err.Error())
+			if !strings.Contains(low, "duplicate") && !strings.Contains(low, "already exists") {
+				log.Printf("migrate user_registrations: %v", err)
+			}
 		}
 	}
 
@@ -747,6 +824,49 @@ func createEmployeeUserDatabase(employeeID string) error {
 	return nil
 }
 
+// processOSUsername 回傳執行此行程的 OS 帳號（等同 whoami）：優先 os/user.Current()，失敗再執行 whoami（Linux／Windows 常見可用）。
+func processOSUsername() string {
+	u, err := user.Current()
+	if err == nil && u.Username != "" {
+		return u.Username
+	}
+	out, err := exec.Command("whoami").Output()
+	if err == nil {
+		if s := strings.TrimSpace(string(out)); s != "" {
+			return s
+		}
+	}
+	return ""
+}
+
+func authAuditContext(c *gin.Context) string {
+	return fmt.Sprintf("os_user:%s；client_ip:%s", processOSUsername(), c.ClientIP())
+}
+
+func validRegistrationShiftSiteDayNight(shiftType, site, dayNight string) bool {
+	if shiftType != "A" && shiftType != "B" {
+		return false
+	}
+	switch site {
+	case "P1", "P2", "P3", "P4":
+	default:
+		return false
+	}
+	if dayNight != "D" && dayNight != "N" {
+		return false
+	}
+	return true
+}
+
+// permitterLogSuffix 附於 admin_log details，明確標示「許可人」工號與角色（與 actor_employee_id 欄位一致）。
+func permitterLogSuffix(c *gin.Context) string {
+	s, ok := managerSessionFromRequest(c)
+	if !ok || s.EmployeeID == "" {
+		return ""
+	}
+	return fmt.Sprintf("；許可人：工號 %s（角色:%s）", s.EmployeeID, s.Role)
+}
+
 // ==================== Authentication Handlers ====================
 
 func loginHandler(c *gin.Context) {
@@ -756,11 +876,13 @@ func loginHandler(c *gin.Context) {
 	}
 
 	if err := c.ShouldBindJSON(&req); err != nil {
+		logAdminActionWithActor("", "登入失敗", "auth", "", fmt.Sprintf("登入失敗：無效的請求本文；%s", authAuditContext(c)))
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request body"})
 		return
 	}
 
 	if req.EmployeeID == "" || req.Password == "" {
+		logAdminActionWithActor(req.EmployeeID, "登入失敗", "auth", req.EmployeeID, fmt.Sprintf("登入失敗：缺少工號或密碼；%s", authAuditContext(c)))
 		c.JSON(http.StatusBadRequest, gin.H{"error": "工號和密碼為必填項"})
 		return
 	}
@@ -779,6 +901,7 @@ func loginHandler(c *gin.Context) {
 	)
 
 	if err == sql.ErrNoRows {
+		logAdminActionWithActor(req.EmployeeID, "登入失敗", "auth", req.EmployeeID, fmt.Sprintf("登入失敗：工號或密碼錯誤；%s", authAuditContext(c)))
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "工號或密碼錯誤"})
 		return
 	} else if err != nil {
@@ -797,6 +920,7 @@ func loginHandler(c *gin.Context) {
 	}
 
 	if hashPassword(req.Password) != passwordHash {
+		logAdminActionWithActor(req.EmployeeID, "登入失敗", "auth", req.EmployeeID, fmt.Sprintf("登入失敗：工號或密碼錯誤；%s", authAuditContext(c)))
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "工號或密碼錯誤"})
 		return
 	}
@@ -809,6 +933,14 @@ func loginHandler(c *gin.Context) {
 
 	user.SessionToken = issueManagerSession(user.EmployeeID, user.Role)
 
+	logAdminActionWithActor(
+		user.EmployeeID,
+		"登入成功",
+		"auth",
+		user.EmployeeID,
+		fmt.Sprintf("登入成功（姓名:%s；角色:%s；%s）", user.Name, user.Role, authAuditContext(c)),
+	)
+
 	c.JSON(http.StatusOK, user)
 }
 
@@ -819,7 +951,30 @@ func logoutHandler(c *gin.Context) {
 	if c.Request.ContentLength > 0 {
 		_ = c.ShouldBindJSON(&body)
 	}
-	revokeManagerSession(body.SessionToken)
+	token := strings.TrimSpace(body.SessionToken)
+	if token == "" {
+		h := c.GetHeader("Authorization")
+		const pfx = "Bearer "
+		if strings.HasPrefix(h, pfx) {
+			token = strings.TrimSpace(strings.TrimPrefix(h, pfx))
+		}
+	}
+	var empID string
+	if token != "" {
+		if v, ok := managerSessions.Load(token); ok {
+			empID = v.(managerSession).EmployeeID
+		}
+	}
+	revokeManagerSession(token)
+	if empID != "" {
+		logAdminActionWithActor(
+			empID,
+			"登出",
+			"auth",
+			empID,
+			fmt.Sprintf("登出（%s）", authAuditContext(c)),
+		)
+	}
 	c.JSON(http.StatusOK, gin.H{"message": "登出成功"})
 }
 
@@ -895,6 +1050,9 @@ func registerUserHandler(c *gin.Context) {
 		EmployeeID      string `json:"employee_id"`
 		Password        string `json:"password"`
 		PasswordConfirm string `json:"password_confirm"`
+		ShiftType       string `json:"shift_type"`
+		Site            string `json:"site"`
+		DayNight        string `json:"day_night"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request body"})
@@ -902,6 +1060,14 @@ func registerUserHandler(c *gin.Context) {
 	}
 	if req.Name == "" || req.EmployeeID == "" || req.Password == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "姓名、工號和密碼為必填項"})
+		return
+	}
+	if req.ShiftType == "" || req.Site == "" || req.DayNight == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "班別、廠區與日夜班為必填項"})
+		return
+	}
+	if !validRegistrationShiftSiteDayNight(req.ShiftType, req.Site, req.DayNight) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "班別須為 A 或 B，廠區須為 P1–P4，日夜班須為 D 或 N"})
 		return
 	}
 	if req.Password != req.PasswordConfirm {
@@ -936,15 +1102,30 @@ func registerUserHandler(c *gin.Context) {
 
 	hash := hashPassword(req.Password)
 	res, err := mainDB.Exec(`
-		INSERT INTO user_registrations (name, employee_id, password_hash, status)
-		VALUES (?, ?, ?, 'pending')
-	`, req.Name, req.EmployeeID, hash)
+		INSERT INTO user_registrations (name, employee_id, password_hash, shift_type, site, day_night, status)
+		VALUES (?, ?, ?, ?, ?, ?, 'pending')
+	`, req.Name, req.EmployeeID, hash, req.ShiftType, req.Site, req.DayNight)
 	if err != nil {
 		log.Printf("register insert: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "註冊失敗"})
 		return
 	}
 	rid, _ := res.LastInsertId()
+	regMeta := fmt.Sprintf("班別:%s 廠區:%s 日夜班:%s", req.ShiftType, req.Site, req.DayNight)
+	actorID := req.EmployeeID
+	details := fmt.Sprintf("自助註冊送出（申請人姓名:%s 工號:%s；%s；registration_id=%d；%s）", req.Name, req.EmployeeID, regMeta, int(rid), authAuditContext(c))
+	if s, ok := managerSessionFromRequest(c); ok && (s.Role == "admin" || s.Role == "manager") {
+		actorID = s.EmployeeID
+		details = fmt.Sprintf("代為送出註冊申請（申請人姓名:%s 工號:%s；%s；操作者工號:%s 角色:%s；registration_id=%d；%s）",
+			req.Name, req.EmployeeID, regMeta, s.EmployeeID, s.Role, int(rid), authAuditContext(c))
+	}
+	logAdminActionWithActor(
+		actorID,
+		"REGISTER_SUBMIT",
+		"user_registrations",
+		fmt.Sprintf("%d", rid),
+		details,
+	)
 	c.JSON(http.StatusCreated, gin.H{
 		"message":          "申請已送出，請待管理員核准後再登入",
 		"registration_id": int(rid),
@@ -956,7 +1137,7 @@ func listUserRegistrationsHandler(c *gin.Context) {
 		return
 	}
 	rows, err := mainDB.Query(`
-		SELECT registration_id, name, employee_id, created_at
+		SELECT registration_id, name, employee_id, shift_type, site, day_night, created_at
 		FROM user_registrations
 		WHERE status = 'pending'
 		ORDER BY created_at ASC
@@ -972,15 +1153,28 @@ func listUserRegistrationsHandler(c *gin.Context) {
 		RegistrationID int    `json:"registration_id"`
 		Name             string `json:"name"`
 		EmployeeID       string `json:"employee_id"`
+		ShiftType        string `json:"shift_type"`
+		Site             string `json:"site"`
+		DayNight         string `json:"day_night"`
 		CreatedAt        string `json:"created_at"`
 	}
 	// 空清單須為 JSON []；nil slice 會變成 null，前端 pendingRegs.length 會拋錯
 	out := make([]row, 0)
 	for rows.Next() {
 		var r row
+		var st, si, dn sql.NullString
 		var createdAt sql.NullTime
-		if err := rows.Scan(&r.RegistrationID, &r.Name, &r.EmployeeID, &createdAt); err != nil {
+		if err := rows.Scan(&r.RegistrationID, &r.Name, &r.EmployeeID, &st, &si, &dn, &createdAt); err != nil {
 			continue
+		}
+		if st.Valid {
+			r.ShiftType = st.String
+		}
+		if si.Valid {
+			r.Site = si.String
+		}
+		if dn.Valid {
+			r.DayNight = dn.String
 		}
 		if createdAt.Valid {
 			r.CreatedAt = createdAt.Time.Format("2006-01-02 15:04:05")
@@ -1014,11 +1208,12 @@ func approveUserRegistrationHandler(c *gin.Context) {
 	}()
 
 	var name, employeeID, passwordHash string
+	var regShift, regSite, regDayNight sql.NullString
 	err = tx.QueryRow(`
-		SELECT name, employee_id, password_hash
+		SELECT name, employee_id, password_hash, shift_type, site, day_night
 		FROM user_registrations
 		WHERE registration_id = ? AND status = 'pending'
-	`, regID).Scan(&name, &employeeID, &passwordHash)
+	`, regID).Scan(&name, &employeeID, &passwordHash, &regShift, &regSite, &regDayNight)
 	if err == sql.ErrNoRows {
 		c.JSON(http.StatusNotFound, gin.H{"error": "查無待審核申請"})
 		return
@@ -1044,6 +1239,19 @@ func approveUserRegistrationHandler(c *gin.Context) {
 	shift := "A"
 	site := "P1"
 	dayNight := "D"
+	if regShift.Valid && regShift.String != "" {
+		shift = regShift.String
+	}
+	if regSite.Valid && regSite.String != "" {
+		site = regSite.String
+	}
+	if regDayNight.Valid && regDayNight.String != "" {
+		dayNight = regDayNight.String
+	}
+	if !validRegistrationShiftSiteDayNight(shift, site, dayNight) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "申請資料中的班別／廠區／日夜班無效，請拒絕後請申請人重新送出"})
+		return
+	}
 
 	res, err := tx.Exec(`
 		INSERT INTO users (name, employee_id, password_hash, shift_type, site, day_night, role, "group")
@@ -1076,9 +1284,9 @@ func approveUserRegistrationHandler(c *gin.Context) {
 			log.Printf("approve rollback user cleanup: %v", e2)
 		}
 		if _, e2 := mainDB.Exec(`
-			INSERT INTO user_registrations (name, employee_id, password_hash, status)
-			VALUES (?, ?, ?, 'pending')
-		`, name, employeeID, passwordHash); e2 != nil {
+			INSERT INTO user_registrations (name, employee_id, password_hash, shift_type, site, day_night, status)
+			VALUES (?, ?, ?, ?, ?, ?, 'pending')
+		`, name, employeeID, passwordHash, shift, site, dayNight); e2 != nil {
 			log.Printf("approve restore registration failed: %v", e2)
 		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "建立使用者資料庫失敗，已還原申請"})
@@ -1090,7 +1298,7 @@ func approveUserRegistrationHandler(c *gin.Context) {
 		"APPROVE_REG",
 		"user_registrations",
 		employeeID,
-		fmt.Sprintf("核准註冊：%s（工號 %s，新 user_id=%d）", name, employeeID, userID),
+		fmt.Sprintf("核准註冊並建立正式帳號：%s（申請人工號 %s，新 user_id=%d；班別:%s 廠區:%s 日夜班:%s）%s", name, employeeID, userID, shift, site, dayNight, permitterLogSuffix(c)),
 	)
 
 	c.JSON(http.StatusOK, gin.H{
@@ -1131,9 +1339,76 @@ func rejectUserRegistrationHandler(c *gin.Context) {
 		"REJECT_REG",
 		"user_registrations",
 		fmt.Sprint(regID),
-		"拒絕註冊申請",
+		fmt.Sprintf("拒絕註冊申請（registration_id=%d）%s", regID, permitterLogSuffix(c)),
 	)
 	c.JSON(http.StatusOK, gin.H{"message": "已拒絕該筆申請"})
+}
+
+// swapUsersDayNightByShiftHandler 僅 admin：將指定班別（A 或 B）下 day_night 為 D/N 的使用者互換日班／夜班。
+// 語意上等同先將 D 改為 NULL、再將 N 改為 D、再將（原 D）NULL 改為 N；以單一 CASE 更新避免誤改 day_night 原為 NULL 之列。
+func swapUsersDayNightByShiftHandler(c *gin.Context) {
+	if !requireAdminAPI(c) {
+		return
+	}
+	var req struct {
+		ShiftType string `json:"shift_type" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request body"})
+		return
+	}
+	st := strings.TrimSpace(strings.ToUpper(req.ShiftType))
+	if st != "A" && st != "B" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "shift_type 須為 A 或 B"})
+		return
+	}
+
+	tx, err := mainDB.Begin()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "無法開始交易"})
+		return
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+
+	res, err := tx.Exec(`
+		UPDATE users SET day_night = CASE day_night
+			WHEN 'D' THEN 'N'
+			WHEN 'N' THEN 'D'
+			ELSE day_night
+		END
+		WHERE shift_type = ? AND day_night IN ('D', 'N')
+	`, st)
+	if err != nil {
+		log.Printf("swap day_night %s: %v", st, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "更新失敗"})
+		return
+	}
+	n, _ := res.RowsAffected()
+	if err := tx.Commit(); err != nil {
+		log.Printf("swap day_night commit: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "提交失敗"})
+		return
+	}
+	committed = true
+
+	logAdminActionWithActor(
+		actorEmployeeIDFromContext(c),
+		"日夜班對調",
+		"users",
+		st,
+		fmt.Sprintf("%s班 使用者 day_night（D/N）批次對調，影響 %d 筆（僅原本為日班或夜班者）", st, n),
+	)
+
+	c.JSON(http.StatusOK, gin.H{
+		"message":    "已更新",
+		"swapped":    int(n),
+		"shift_type": st,
+	})
 }
 
 func getUsersHandler(c *gin.Context) {
@@ -2519,13 +2794,382 @@ func deleteLeaveTypeHandler(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"message": "请假类型删除成功"})
 }
 
+// ensureLeaveRecordsSchema 確保各人員庫內 leave_records 表與 (user_id, leave_type_id, date) 唯一索引存在。
+func ensureLeaveRecordsSchema(userDb *sql.DB) error {
+	if _, err := userDb.Exec(`
+		CREATE TABLE IF NOT EXISTS leave_records (
+			user_id        INTEGER NOT NULL,
+			leave_type_id  INTEGER NOT NULL,
+			date           DATE NOT NULL,
+			total_hours    REAL NOT NULL,
+			created_at     DATETIME DEFAULT CURRENT_TIMESTAMP
+		)
+	`); err != nil {
+		return err
+	}
+	_, err := userDb.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_leave_records_uid_lt_date ON leave_records(user_id, leave_type_id, date)`)
+	return err
+}
+
+func userIDFromEmployeeID(employeeID string) (int, error) {
+	var userID int
+	err := mainDB.QueryRow(`SELECT user_id FROM users WHERE employee_id = ?`, employeeID).Scan(&userID)
+	return userID, err
+}
+
+func getLeaveRecordsHandler(c *gin.Context) {
+	employeeID := c.Param("employeeId")
+	userDbPath := filepath.Join("..", fmt.Sprintf("%s.db", employeeID))
+	if _, err := os.Stat(userDbPath); os.IsNotExist(err) {
+		c.JSON(http.StatusNotFound, gin.H{"error": "用户数据库不存在"})
+		return
+	}
+	userID, err := userIDFromEmployeeID(employeeID)
+	if err == sql.ErrNoRows {
+		c.JSON(http.StatusNotFound, gin.H{"error": "用户不存在"})
+		return
+	}
+	if err != nil {
+		log.Printf("leave-records user lookup: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "读取用户失败"})
+		return
+	}
+	userDb, err := sql.Open("sqlite", userDbPath)
+	if err != nil {
+		log.Printf("Open user DB error: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "连接用户数据库失败"})
+		return
+	}
+	defer userDb.Close()
+	if err := ensureLeaveRecordsSchema(userDb); err != nil {
+		log.Printf("leave_records schema: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "创建表失败"})
+		return
+	}
+	ensureUserLogSchema(userDb)
+	rows, err := userDb.Query(`
+		SELECT user_id, leave_type_id, date, total_hours, created_at
+		FROM leave_records WHERE user_id = ? ORDER BY date DESC, leave_type_id
+	`, userID)
+	if err != nil {
+		log.Printf("Get leave records error: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "获取请假记录失败"})
+		return
+	}
+	defer rows.Close()
+	out := make([]LeaveRecord, 0)
+	for rows.Next() {
+		var r LeaveRecord
+		var th float64
+		var createdAt sql.NullTime
+		if err := rows.Scan(&r.UserID, &r.LeaveTypeID, &r.Date, &th, &createdAt); err != nil {
+			log.Printf("Scan leave record error: %v", err)
+			continue
+		}
+		r.TotalHours = float32(th)
+		r.CreatedAt = nilIfZeroTimestamp(createdAt)
+		out = append(out, r)
+	}
+	c.JSON(http.StatusOK, out)
+}
+
+func createLeaveRecordHandler(c *gin.Context) {
+	employeeID := c.Param("employeeId")
+	var req struct {
+		LeaveTypeID int     `json:"leave_type_id"`
+		Date        string  `json:"date"`
+		TotalHours  float64 `json:"total_hours"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request body"})
+		return
+	}
+	if req.LeaveTypeID <= 0 || strings.TrimSpace(req.Date) == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "leave_type_id 與 date 為必填"})
+		return
+	}
+	if req.TotalHours < 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "total_hours 不可為負數"})
+		return
+	}
+	var ltCheck int
+	if err := mainDB.QueryRow(`SELECT leave_id FROM leave_types WHERE leave_id = ?`, req.LeaveTypeID).Scan(&ltCheck); err == sql.ErrNoRows {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "請假類型不存在"})
+		return
+	} else if err != nil {
+		log.Printf("leave-records leave type check: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "驗證假別失敗"})
+		return
+	}
+	userDbPath := filepath.Join("..", fmt.Sprintf("%s.db", employeeID))
+	if _, err := os.Stat(userDbPath); os.IsNotExist(err) {
+		c.JSON(http.StatusNotFound, gin.H{"error": "用户数据库不存在"})
+		return
+	}
+	userID, err := userIDFromEmployeeID(employeeID)
+	if err == sql.ErrNoRows {
+		c.JSON(http.StatusNotFound, gin.H{"error": "用户不存在"})
+		return
+	}
+	if err != nil {
+		log.Printf("leave-records user lookup: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "读取用户失败"})
+		return
+	}
+	userDb, err := sql.Open("sqlite", userDbPath)
+	if err != nil {
+		log.Printf("Open user DB error: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "连接用户数据库失败"})
+		return
+	}
+	defer userDb.Close()
+	if err := ensureLeaveRecordsSchema(userDb); err != nil {
+		log.Printf("leave_records schema: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "创建表失败"})
+		return
+	}
+	ensureUserLogSchema(userDb)
+	now := nowLocalString()
+	_, err = userDb.Exec(`
+		INSERT INTO leave_records (user_id, leave_type_id, date, total_hours, created_at)
+		VALUES (?, ?, ?, ?, ?)
+	`, userID, req.LeaveTypeID, req.Date, req.TotalHours, now)
+	if err != nil {
+		if strings.Contains(strings.ToLower(err.Error()), "unique") {
+			c.JSON(http.StatusConflict, gin.H{"error": "該日與假別已有請假紀錄"})
+			return
+		}
+		log.Printf("Create leave record error: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "建立請假紀錄失敗"})
+		return
+	}
+	recKey := fmt.Sprintf("%d|%s", req.LeaveTypeID, req.Date)
+	logUserActionWithActor(
+		userDb,
+		actorEmployeeIDFromContext(c),
+		"CREATE",
+		"leave_records",
+		recKey,
+		fmt.Sprintf("新增請假（leave_type_id=%d 日期:%s 時數:%.2f）", req.LeaveTypeID, req.Date, req.TotalHours),
+	)
+	c.JSON(http.StatusCreated, gin.H{
+		"user_id":       userID,
+		"leave_type_id": req.LeaveTypeID,
+		"date":          req.Date,
+		"total_hours":   req.TotalHours,
+		"message":       "請假紀錄已建立",
+	})
+}
+
+func updateLeaveRecordHandler(c *gin.Context) {
+	employeeID := c.Param("employeeId")
+	var req struct {
+		PreviousLeaveTypeID *int    `json:"previous_leave_type_id"`
+		PreviousDate        *string `json:"previous_date"`
+		LeaveTypeID         int     `json:"leave_type_id"`
+		Date                string  `json:"date"`
+		TotalHours          float64 `json:"total_hours"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request body"})
+		return
+	}
+	if req.LeaveTypeID <= 0 || strings.TrimSpace(req.Date) == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "leave_type_id 與 date 為必填"})
+		return
+	}
+	if req.TotalHours < 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "total_hours 不可為負數"})
+		return
+	}
+	prevDateStr := ""
+	if req.PreviousDate != nil {
+		prevDateStr = strings.TrimSpace(*req.PreviousDate)
+	}
+	hasPrevPair := req.PreviousLeaveTypeID != nil && prevDateStr != ""
+	hasPartialPrev := (req.PreviousLeaveTypeID != nil || prevDateStr != "") && !hasPrevPair
+	if hasPartialPrev {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "變更鍵時須同時提供 previous_leave_type_id 與 previous_date"})
+		return
+	}
+	var ltCheck int
+	if err := mainDB.QueryRow(`SELECT leave_id FROM leave_types WHERE leave_id = ?`, req.LeaveTypeID).Scan(&ltCheck); err == sql.ErrNoRows {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "請假類型不存在"})
+		return
+	} else if err != nil {
+		log.Printf("leave-records leave type check: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "驗證假別失敗"})
+		return
+	}
+	userDbPath := filepath.Join("..", fmt.Sprintf("%s.db", employeeID))
+	if _, err := os.Stat(userDbPath); os.IsNotExist(err) {
+		c.JSON(http.StatusNotFound, gin.H{"error": "用户数据库不存在"})
+		return
+	}
+	userID, err := userIDFromEmployeeID(employeeID)
+	if err == sql.ErrNoRows {
+		c.JSON(http.StatusNotFound, gin.H{"error": "用户不存在"})
+		return
+	}
+	if err != nil {
+		log.Printf("leave-records user lookup: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "读取用户失败"})
+		return
+	}
+	userDb, err := sql.Open("sqlite", userDbPath)
+	if err != nil {
+		log.Printf("Open user DB error: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "连接用户数据库失败"})
+		return
+	}
+	defer userDb.Close()
+	if err := ensureLeaveRecordsSchema(userDb); err != nil {
+		log.Printf("leave_records schema: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "创建表失败"})
+		return
+	}
+	ensureUserLogSchema(userDb)
+	now := nowLocalString()
+	var res sql.Result
+	if hasPrevPair {
+		if *req.PreviousLeaveTypeID <= 0 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "previous_leave_type_id 無效"})
+			return
+		}
+		res, err = userDb.Exec(`
+			UPDATE leave_records
+			SET leave_type_id = ?, date = ?, total_hours = ?, created_at = ?
+			WHERE user_id = ? AND leave_type_id = ? AND date = ?
+		`, req.LeaveTypeID, req.Date, req.TotalHours, now, userID, *req.PreviousLeaveTypeID, prevDateStr)
+	} else {
+		res, err = userDb.Exec(`
+			UPDATE leave_records SET total_hours = ?, created_at = ?
+			WHERE user_id = ? AND leave_type_id = ? AND date = ?
+		`, req.TotalHours, now, userID, req.LeaveTypeID, req.Date)
+	}
+	if err != nil {
+		if strings.Contains(strings.ToLower(err.Error()), "unique") {
+			c.JSON(http.StatusConflict, gin.H{"error": "更新後與既有紀錄衝突"})
+			return
+		}
+		log.Printf("Update leave record error: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "更新請假紀錄失敗"})
+		return
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		c.JSON(http.StatusNotFound, gin.H{"error": "請假紀錄不存在"})
+		return
+	}
+	prevKey := fmt.Sprintf("%d|%s", req.LeaveTypeID, req.Date)
+	if hasPrevPair {
+		prevKey = fmt.Sprintf("%d|%s", *req.PreviousLeaveTypeID, prevDateStr)
+	}
+	logUserActionWithActor(
+		userDb,
+		actorEmployeeIDFromContext(c),
+		"UPDATE",
+		"leave_records",
+		prevKey,
+		fmt.Sprintf("更新請假（鍵:%s → leave_type_id=%d 日期:%s 時數:%.2f）", prevKey, req.LeaveTypeID, req.Date, req.TotalHours),
+	)
+	c.JSON(http.StatusOK, gin.H{"message": "請假紀錄已更新"})
+}
+
+func deleteLeaveRecordHandler(c *gin.Context) {
+	employeeID := c.Param("employeeId")
+	leaveTypeStr := c.Query("leave_type_id")
+	date := c.Query("date")
+	if strings.TrimSpace(leaveTypeStr) == "" || strings.TrimSpace(date) == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "請提供查詢參數 leave_type_id 與 date"})
+		return
+	}
+	leaveTypeID, err := strconv.Atoi(leaveTypeStr)
+	if err != nil || leaveTypeID <= 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "leave_type_id 無效"})
+		return
+	}
+	userDbPath := filepath.Join("..", fmt.Sprintf("%s.db", employeeID))
+	if _, err := os.Stat(userDbPath); os.IsNotExist(err) {
+		c.JSON(http.StatusNotFound, gin.H{"error": "用户数据库不存在"})
+		return
+	}
+	userID, err := userIDFromEmployeeID(employeeID)
+	if err == sql.ErrNoRows {
+		c.JSON(http.StatusNotFound, gin.H{"error": "用户不存在"})
+		return
+	}
+	if err != nil {
+		log.Printf("leave-records user lookup: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "读取用户失败"})
+		return
+	}
+	userDb, err := sql.Open("sqlite", userDbPath)
+	if err != nil {
+		log.Printf("Open user DB error: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "连接用户数据库失败"})
+		return
+	}
+	defer userDb.Close()
+	if err := ensureLeaveRecordsSchema(userDb); err != nil {
+		log.Printf("leave_records schema: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "创建表失败"})
+		return
+	}
+	ensureUserLogSchema(userDb)
+	res, err := userDb.Exec(`DELETE FROM leave_records WHERE user_id = ? AND leave_type_id = ? AND date = ?`, userID, leaveTypeID, date)
+	if err != nil {
+		log.Printf("Delete leave record error: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "刪除請假紀錄失敗"})
+		return
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		c.JSON(http.StatusNotFound, gin.H{"error": "請假紀錄不存在"})
+		return
+	}
+	recKey := fmt.Sprintf("%d|%s", leaveTypeID, date)
+	logUserActionWithActor(
+		userDb,
+		actorEmployeeIDFromContext(c),
+		"DELETE",
+		"leave_records",
+		recKey,
+		fmt.Sprintf("刪除請假（leave_type_id=%d 日期:%s）", leaveTypeID, date),
+	)
+	c.JSON(http.StatusOK, gin.H{"message": "請假紀錄已刪除"})
+}
+
 func getLogsHandler(c *gin.Context) {
+	sess, ok := managerSessionFromRequest(c)
+	if !ok {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "請使用管理員或經理登入後取得的 session 存取日誌"})
+		return
+	}
+	if sess.Role != "admin" && sess.Role != "manager" {
+		c.JSON(http.StatusForbidden, gin.H{"error": "僅限管理員或經理"})
+		return
+	}
+	viewerIsAdmin := sess.Role == "admin"
+
+	// employee_id → role（供 user_log 與 JOIN 缺漏時判斷作用者是否為 admin）
+	roleByEmpID := make(map[string]string)
+	if rr, err := mainDB.Query(`SELECT employee_id, role FROM users`); err == nil {
+		for rr.Next() {
+			var eid, r string
+			if err := rr.Scan(&eid, &r); err == nil {
+				roleByEmpID[eid] = r
+			}
+		}
+		rr.Close()
+	}
+
 	allLogs := make([]LogEntry, 0)
 
 	// 1. Get Admin Logs（LEFT JOIN users 取得作用者姓名，actor_employee_id 為舊資料時可能為空）
 	adminRows, err := mainDB.Query(`
 		SELECT al.log_id, al.action, al.table_name, al.record_id, al.details, al.created_at,
-		       al.actor_employee_id, u.name AS actor_name
+		       al.actor_employee_id, u.name AS actor_name, u.role AS actor_role
 		FROM admin_log al
 		LEFT JOIN users u ON u.employee_id = al.actor_employee_id
 	`)
@@ -2542,8 +3186,21 @@ func getLogsHandler(c *gin.Context) {
 		var details sql.NullString
 		var actorEmp sql.NullString
 		var actorName sql.NullString
-		err := adminRows.Scan(&l.LogID, &l.Action, &l.TableName, &l.RecordID, &details, &created, &actorEmp, &actorName)
+		var actorRole sql.NullString
+		err := adminRows.Scan(&l.LogID, &l.Action, &l.TableName, &l.RecordID, &details, &created, &actorEmp, &actorName, &actorRole)
 		if err == nil {
+			if !viewerIsAdmin && actorEmp.Valid && actorEmp.String != "" {
+				ar := ""
+				if actorRole.Valid {
+					ar = actorRole.String
+				}
+				if ar == "" {
+					ar = roleByEmpID[actorEmp.String]
+				}
+				if ar == "admin" {
+					continue
+				}
+			}
 			switch {
 			case actorName.Valid && actorName.String != "" && actorEmp.Valid && actorEmp.String != "":
 				l.User = fmt.Sprintf("%s (%s)", actorName.String, actorEmp.String)
@@ -2554,6 +3211,8 @@ func getLogsHandler(c *gin.Context) {
 			}
 			l.Details = details.String
 			l.CreatedAt = nilIfZeroTimestamp(created)
+			l.LogSource = "admin"
+			l.OwnerEmployeeID = ""
 			allLogs = append(allLogs, l)
 		}
 	}
@@ -2596,6 +3255,11 @@ func getLogsHandler(c *gin.Context) {
 								var actorEmp sql.NullString
 								err := uRows.Scan(&l.LogID, &l.Action, &l.TableName, &l.RecordID, &details, &created, &actorEmp)
 								if err == nil {
+									if !viewerIsAdmin && actorEmp.Valid && actorEmp.String != "" {
+										if roleByEmpID[actorEmp.String] == "admin" {
+											continue
+										}
+									}
 									// 作用者：優先顯示實際操作者；舊資料無 actor 時退回 DB 擁有者
 									if actorEmp.Valid && actorEmp.String != "" {
 										if name, ok := actorNameByEmpID[actorEmp.String]; ok && name != "" {
@@ -2616,6 +3280,8 @@ func getLogsHandler(c *gin.Context) {
 									}
 
 									l.CreatedAt = nilIfZeroTimestamp(created)
+									l.LogSource = "user"
+									l.OwnerEmployeeID = empID
 									allLogs = append(allLogs, l)
 								}
 							}
@@ -2640,4 +3306,163 @@ func getLogsHandler(c *gin.Context) {
 	})
 
 	c.JSON(http.StatusOK, allLogs)
+}
+
+type deleteLogEntryItem struct {
+	LogSource       string `json:"log_source" binding:"required"`
+	LogID           int    `json:"log_id" binding:"required"`
+	OwnerEmployeeID string `json:"owner_employee_id"`
+}
+
+func deleteLogsBatchHandler(c *gin.Context) {
+	if !requireAdminAPI(c) {
+		return
+	}
+	var req struct {
+		Entries []deleteLogEntryItem `json:"entries" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil || len(req.Entries) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "請提供 entries 陣列"})
+		return
+	}
+
+	adminIDs := make([]int, 0)
+	userByOwner := make(map[string][]int)
+	for _, e := range req.Entries {
+		switch e.LogSource {
+		case "admin":
+			if e.LogID > 0 {
+				adminIDs = append(adminIDs, e.LogID)
+			}
+		case "user":
+			if e.LogID <= 0 || !safeLogOwnerEmployeeID(e.OwnerEmployeeID) {
+				continue
+			}
+			userByOwner[e.OwnerEmployeeID] = append(userByOwner[e.OwnerEmployeeID], e.LogID)
+		default:
+			continue
+		}
+	}
+
+	deleted := 0
+	for _, id := range adminIDs {
+		res, err := mainDB.Exec(`DELETE FROM admin_log WHERE log_id = ?`, id)
+		if err != nil {
+			log.Printf("delete admin_log %d: %v", id, err)
+			continue
+		}
+		n, _ := res.RowsAffected()
+		deleted += int(n)
+	}
+	for owner, ids := range userByOwner {
+		userDbPath := filepath.Join("..", fmt.Sprintf("%s.db", owner))
+		if _, err := os.Stat(userDbPath); os.IsNotExist(err) {
+			continue
+		}
+		userDb, err := sql.Open("sqlite", userDbPath)
+		if err != nil {
+			log.Printf("delete logs open user db %s: %v", owner, err)
+			continue
+		}
+		for _, id := range ids {
+			res, err := userDb.Exec(`DELETE FROM user_log WHERE log_id = ?`, id)
+			if err != nil {
+				log.Printf("delete user_log %s %d: %v", owner, id, err)
+				continue
+			}
+			n, _ := res.RowsAffected()
+			deleted += int(n)
+		}
+		_ = userDb.Close()
+	}
+
+	if deleted > 0 {
+		logAdminActionWithActor(
+			actorEmployeeIDFromContext(c),
+			"DELETE_LOG_BATCH",
+			"logs",
+			fmt.Sprintf("batch-%d", time.Now().UnixNano()),
+			fmt.Sprintf("批次刪除日誌 %d 筆", deleted),
+		)
+	}
+
+	c.JSON(http.StatusOK, gin.H{"deleted": deleted})
+}
+
+func deleteLogsBeforeHandler(c *gin.Context) {
+	if !requireAdminAPI(c) {
+		return
+	}
+	var req struct {
+		Before string `json:"before" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "請提供 before（截止時間）"})
+		return
+	}
+	cutoff, err := parseLogCutoffTime(req.Before)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "時間格式無效，請用 YYYY-MM-DD 或含時分"})
+		return
+	}
+	cutoffStr := cutoff.Format("2006-01-02 15:04:05")
+
+	res, err := mainDB.Exec(`DELETE FROM admin_log WHERE created_at IS NOT NULL AND created_at < ?`, cutoffStr)
+	if err != nil {
+		log.Printf("delete admin_log before %s: %v", cutoffStr, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "刪除主庫日誌失敗"})
+		return
+	}
+	deletedAdmin64, _ := res.RowsAffected()
+	deletedAdmin := int(deletedAdmin64)
+
+	deletedUser := 0
+	userRows, errU := mainDB.Query("SELECT employee_id FROM users")
+	if errU == nil {
+		defer userRows.Close()
+		for userRows.Next() {
+			var empID string
+			if err := userRows.Scan(&empID); err != nil {
+				continue
+			}
+			if !safeLogOwnerEmployeeID(empID) {
+				continue
+			}
+			userDbPath := filepath.Join("..", fmt.Sprintf("%s.db", empID))
+			if _, err := os.Stat(userDbPath); os.IsNotExist(err) {
+				continue
+			}
+			userDb, err := sql.Open("sqlite", userDbPath)
+			if err != nil {
+				continue
+			}
+			ensureUserLogSchema(userDb)
+			r2, err := userDb.Exec(`DELETE FROM user_log WHERE created_at IS NOT NULL AND created_at < ?`, cutoffStr)
+			_ = userDb.Close()
+			if err != nil {
+				log.Printf("delete user_log before %s %s: %v", empID, cutoffStr, err)
+				continue
+			}
+			nu, _ := r2.RowsAffected()
+			deletedUser += int(nu)
+		}
+	}
+
+	total := deletedAdmin + deletedUser
+	if total > 0 {
+		logAdminActionWithActor(
+			actorEmployeeIDFromContext(c),
+			"DELETE_LOG_BEFORE",
+			"logs",
+			cutoffStr,
+			fmt.Sprintf("刪除生效時間早於 %s 的日誌（admin_log %d 筆、user_log %d 筆）", cutoffStr, deletedAdmin, deletedUser),
+		)
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"deleted":       total,
+		"deleted_admin": deletedAdmin,
+		"deleted_user":  deletedUser,
+		"before":        cutoffStr,
+	})
 }
