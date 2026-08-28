@@ -9,7 +9,6 @@ import (
 	"encoding/hex"
 	"fmt"
 	"log"
-	"math"
 	"net"
 	"net/http"
 	"os"
@@ -111,17 +110,17 @@ func (t *Timestamp) Scan(value interface{}) error {
 }
 
 type User struct {
-	UserID                  int        `json:"user_id"`
-	Name                    string     `json:"name"`
-	EmployeeID              string     `json:"employee_id"`
-	ShiftType               *string    `json:"shift_type"`
-	Site                    *string    `json:"site"`
-	DayNight                *string    `json:"day_night"`
-	Role                    string     `json:"role"`
-	Group                   string     `json:"group"`
-	MonthlyOvertimeCapHours *int       `json:"monthly_overtime_cap_hours"`
-	PasswordHash            string     `json:"-"`
-	CreatedAt               *Timestamp `json:"created_at"`
+	UserID                   int        `json:"user_id"`
+	Name                     string     `json:"name"`
+	EmployeeID               string     `json:"employee_id"`
+	ShiftType                *string    `json:"shift_type"`
+	Site                     *string    `json:"site"`
+	DayNight                 *string    `json:"day_night"`
+	Role                     string     `json:"role"`
+	Group                    string     `json:"group"`
+	MonthlyOvertimeCapHours  *int       `json:"monthly_overtime_cap_hours"`
+	PasswordHash             string     `json:"-"`
+	CreatedAt                *Timestamp `json:"created_at"`
 	// 僅登入回應：供 admin/manager 呼叫待審註冊 API（Bearer），不來自資料庫欄位
 	SessionToken string `json:"session_token,omitempty"`
 }
@@ -261,7 +260,6 @@ type ShiftAssignment struct {
 	ShiftType     string     `json:"shift_type"`
 	Comment       string     `json:"comment"`
 	OvertimeShift *string    `json:"overtime_shift"`
-	WorkHours     *float64   `json:"work_hours"`
 	CreatedAt     *Timestamp `json:"created_at"`
 	UpdatedAt     *Timestamp `json:"updated_at"`
 }
@@ -275,15 +273,7 @@ func isAllowedOvertimeShift(s string) bool {
 	}
 }
 
-func isValidWorkHours(v float64) bool {
-	if v < 0 || v > 15 {
-		return false
-	}
-	scaled := v * 100
-	return math.Abs(scaled-math.Round(scaled)) < 1e-9
-}
-
-// ensureShiftAssignmentsSchema 建立表並為舊庫補上 overtime_shift / work_hours 欄位
+// ensureShiftAssignmentsSchema 建立表並為舊庫補上 overtime_shift 欄位
 func ensureShiftAssignmentsSchema(userDb *sql.DB) error {
 	_, err := userDb.Exec(`
 		CREATE TABLE IF NOT EXISTS shift_assignments (
@@ -292,7 +282,6 @@ func ensureShiftAssignmentsSchema(userDb *sql.DB) error {
 			shift_type     TEXT NOT NULL,
 			comment        TEXT,
 			overtime_shift TEXT,
-			work_hours     REAL,
 			created_at     DATETIME DEFAULT CURRENT_TIMESTAMP,
 			updated_at     DATETIME DEFAULT CURRENT_TIMESTAMP,
 			PRIMARY KEY (employee_id, date)
@@ -308,16 +297,6 @@ func ensureShiftAssignmentsSchema(userDb *sql.DB) error {
 	}
 	if n == 0 {
 		_, err = userDb.Exec(`ALTER TABLE shift_assignments ADD COLUMN overtime_shift TEXT`)
-		if err != nil {
-			return err
-		}
-	}
-	err = userDb.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('shift_assignments') WHERE name = 'work_hours'`).Scan(&n)
-	if err != nil {
-		return err
-	}
-	if n == 0 {
-		_, err = userDb.Exec(`ALTER TABLE shift_assignments ADD COLUMN work_hours REAL`)
 	}
 	return err
 }
@@ -1148,7 +1127,7 @@ func registerUserHandler(c *gin.Context) {
 		details,
 	)
 	c.JSON(http.StatusCreated, gin.H{
-		"message":         "申請已送出，請待管理員核准後再登入",
+		"message":          "申請已送出，請待管理員核准後再登入",
 		"registration_id": int(rid),
 	})
 }
@@ -1172,12 +1151,12 @@ func listUserRegistrationsHandler(c *gin.Context) {
 
 	type row struct {
 		RegistrationID int    `json:"registration_id"`
-		Name           string `json:"name"`
-		EmployeeID     string `json:"employee_id"`
-		ShiftType      string `json:"shift_type"`
-		Site           string `json:"site"`
-		DayNight       string `json:"day_night"`
-		CreatedAt      string `json:"created_at"`
+		Name             string `json:"name"`
+		EmployeeID       string `json:"employee_id"`
+		ShiftType        string `json:"shift_type"`
+		Site             string `json:"site"`
+		DayNight         string `json:"day_night"`
+		CreatedAt        string `json:"created_at"`
 	}
 	// 空清單須為 JSON []；nil slice 會變成 null，前端 pendingRegs.length 會拋錯
 	out := make([]row, 0)
@@ -1323,15 +1302,15 @@ func approveUserRegistrationHandler(c *gin.Context) {
 	)
 
 	c.JSON(http.StatusOK, gin.H{
-		"user_id":     int(userID),
-		"name":        name,
-		"employee_id": employeeID,
-		"shift_type":  shift,
-		"site":        site,
-		"day_night":   dayNight,
-		"role":        role,
-		"group":       group,
-		"message":     "已核准並建立帳號",
+		"user_id":      int(userID),
+		"name":         name,
+		"employee_id":  employeeID,
+		"shift_type":   shift,
+		"site":         site,
+		"day_night":    dayNight,
+		"role":         role,
+		"group":        group,
+		"message":      "已核准並建立帳號",
 	})
 }
 
@@ -1508,15 +1487,15 @@ func getUserHandler(c *gin.Context) {
 
 func createUserHandler(c *gin.Context) {
 	var req struct {
-		Name                    string  `json:"name"`
-		EmployeeID              string  `json:"employee_id"`
-		Password                string  `json:"password"`
-		ShiftType               *string `json:"shift_type"`
-		Site                    *string `json:"site"`
-		DayNight                *string `json:"day_night"`
-		Role                    string  `json:"role"`
-		Group                   string  `json:"group"`
-		MonthlyOvertimeCapHours *int    `json:"monthly_overtime_cap_hours"`
+		Name                     string  `json:"name"`
+		EmployeeID               string  `json:"employee_id"`
+		Password                 string  `json:"password"`
+		ShiftType                *string `json:"shift_type"`
+		Site                     *string `json:"site"`
+		DayNight                 *string `json:"day_night"`
+		Role                     string  `json:"role"`
+		Group                    string  `json:"group"`
+		MonthlyOvertimeCapHours  *int    `json:"monthly_overtime_cap_hours"`
 	}
 
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -1604,16 +1583,16 @@ func updateUserHandler(c *gin.Context) {
 	userID := c.Param("id")
 
 	var req struct {
-		Name                    string  `json:"name"`
-		EmployeeID              string  `json:"employee_id"`
-		ShiftType               *string `json:"shift_type"`
-		Site                    *string `json:"site"`
-		DayNight                *string `json:"day_night"`
-		Role                    string  `json:"role"`
-		Group                   *string `json:"group"`
-		Password                string  `json:"password"`
-		MonthlyOvertimeCapHours *int    `json:"monthly_overtime_cap_hours"`
-		ClearMonthlyOvertimeCap *bool   `json:"clear_monthly_overtime_cap"`
+		Name                     string  `json:"name"`
+		EmployeeID               string  `json:"employee_id"`
+		ShiftType                *string `json:"shift_type"`
+		Site                     *string `json:"site"`
+		DayNight                 *string `json:"day_night"`
+		Role                     string  `json:"role"`
+		Group                    *string `json:"group"`
+		Password                 string  `json:"password"`
+		MonthlyOvertimeCapHours  *int    `json:"monthly_overtime_cap_hours"`
+		ClearMonthlyOvertimeCap  *bool   `json:"clear_monthly_overtime_cap"`
 	}
 
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -2264,7 +2243,7 @@ func getShiftAssignmentsHandler(c *gin.Context) {
 
 	ensureUserLogSchema(userDb)
 
-	rows, err := userDb.Query("SELECT employee_id, date, shift_type, comment, overtime_shift, work_hours, created_at, updated_at FROM shift_assignments ORDER BY date")
+	rows, err := userDb.Query("SELECT employee_id, date, shift_type, comment, overtime_shift, created_at, updated_at FROM shift_assignments ORDER BY date")
 	if err != nil {
 		log.Printf("Get shift assignments error: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "获取排班数据失败"})
@@ -2277,10 +2256,9 @@ func getShiftAssignmentsHandler(c *gin.Context) {
 		var assignment ShiftAssignment
 		var comment sql.NullString
 		var overtimeShift sql.NullString
-		var workHours sql.NullFloat64
 		var createdAt, updatedAt sql.NullTime
 
-		err := rows.Scan(&assignment.EmployeeID, &assignment.Date, &assignment.ShiftType, &comment, &overtimeShift, &workHours, &createdAt, &updatedAt)
+		err := rows.Scan(&assignment.EmployeeID, &assignment.Date, &assignment.ShiftType, &comment, &overtimeShift, &createdAt, &updatedAt)
 		if err != nil {
 			log.Printf("Scan shift assignment error: %v", err)
 			continue
@@ -2290,10 +2268,6 @@ func getShiftAssignmentsHandler(c *gin.Context) {
 		if overtimeShift.Valid {
 			s := overtimeShift.String
 			assignment.OvertimeShift = &s
-		}
-		if workHours.Valid {
-			h := workHours.Float64
-			assignment.WorkHours = &h
 		}
 		assignment.CreatedAt = nilIfZeroTimestamp(createdAt)
 		assignment.UpdatedAt = nilIfZeroTimestamp(updatedAt)
@@ -2309,10 +2283,9 @@ func setShiftAssignmentHandler(c *gin.Context) {
 	date := c.Param("date")
 
 	var req struct {
-		ShiftType     string   `json:"shift_type"`
-		Comment       string   `json:"comment"`
-		OvertimeShift *string  `json:"overtime_shift"`
-		WorkHours     *float64 `json:"work_hours"`
+		ShiftType     string  `json:"shift_type"`
+		Comment       string  `json:"comment"`
+		OvertimeShift *string `json:"overtime_shift"`
 	}
 
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -2332,14 +2305,6 @@ func setShiftAssignmentHandler(c *gin.Context) {
 			return
 		}
 		overtimeShift = sql.NullString{String: *req.OvertimeShift, Valid: true}
-	}
-	var workHours sql.NullFloat64
-	if req.WorkHours != nil {
-		if !isValidWorkHours(*req.WorkHours) {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "work_hours 僅能為 0~15 且最多小數點兩位"})
-			return
-		}
-		workHours = sql.NullFloat64{Float64: *req.WorkHours, Valid: true}
 	}
 
 	userDbPath := filepath.Join("..", fmt.Sprintf("%s.db", employeeID))
@@ -2368,15 +2333,14 @@ func setShiftAssignmentHandler(c *gin.Context) {
 
 	now := time.Now().Format("2006-01-02 15:04:05")
 	_, err = userDb.Exec(`
-		INSERT INTO shift_assignments (employee_id, date, shift_type, comment, overtime_shift, work_hours, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO shift_assignments (employee_id, date, shift_type, comment, overtime_shift, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(employee_id, date) DO UPDATE SET
 			shift_type = excluded.shift_type,
 			comment = excluded.comment,
 			overtime_shift = excluded.overtime_shift,
-			work_hours = excluded.work_hours,
 			updated_at = ?
-	`, employeeID, date, req.ShiftType, req.Comment, overtimeShift, workHours, now, now, now)
+	`, employeeID, date, req.ShiftType, req.Comment, overtimeShift, now, now, now)
 
 	if err != nil {
 		log.Printf("Save shift assignment error: %v", err)
@@ -2397,11 +2361,6 @@ func setShiftAssignmentHandler(c *gin.Context) {
 	} else {
 		resp["overtime_shift"] = nil
 	}
-	if workHours.Valid {
-		resp["work_hours"] = workHours.Float64
-	} else {
-		resp["work_hours"] = nil
-	}
 
 	c.JSON(http.StatusOK, resp)
 
@@ -2409,17 +2368,13 @@ func setShiftAssignmentHandler(c *gin.Context) {
 	if overtimeShift.Valid {
 		otLog = "，跨班加班:" + overtimeShift.String
 	}
-	whLog := ""
-	if workHours.Valid {
-		whLog = fmt.Sprintf("，工時:%.2f", workHours.Float64)
-	}
 	logUserActionWithActor(
 		userDb,
 		actorEmployeeIDFromContext(c),
 		"UPSERT",
 		"shift_assignments",
 		date,
-		fmt.Sprintf("假別:%s，備註:%s%s%s", req.ShiftType, req.Comment, otLog, whLog),
+		fmt.Sprintf("假別:%s，備註:%s%s", req.ShiftType, req.Comment, otLog),
 	)
 }
 
@@ -2510,8 +2465,7 @@ func moveShiftAssignmentHandler(c *gin.Context) {
 
 	var shiftType string
 	var srcOT sql.NullString
-	var srcWorkHours sql.NullFloat64
-	err = userDb.QueryRow("SELECT shift_type, overtime_shift, work_hours FROM shift_assignments WHERE employee_id = ? AND date = ?", employeeID, req.FromDate).Scan(&shiftType, &srcOT, &srcWorkHours)
+	err = userDb.QueryRow("SELECT shift_type, overtime_shift FROM shift_assignments WHERE employee_id = ? AND date = ?", employeeID, req.FromDate).Scan(&shiftType, &srcOT)
 	if err == sql.ErrNoRows {
 		c.JSON(http.StatusNotFound, gin.H{"error": "源排班不存在"})
 		return
@@ -2523,8 +2477,7 @@ func moveShiftAssignmentHandler(c *gin.Context) {
 
 	var existingShift string
 	var tgtOT sql.NullString
-	var tgtWorkHours sql.NullFloat64
-	err = userDb.QueryRow("SELECT shift_type, overtime_shift, work_hours FROM shift_assignments WHERE employee_id = ? AND date = ?", req.ToEmployeeID, req.ToDate).Scan(&existingShift, &tgtOT, &tgtWorkHours)
+	err = userDb.QueryRow("SELECT shift_type, overtime_shift FROM shift_assignments WHERE employee_id = ? AND date = ?", req.ToEmployeeID, req.ToDate).Scan(&existingShift, &tgtOT)
 
 	if err == sql.ErrNoRows {
 		now := time.Now().Format("2006-01-02 15:04:05")
@@ -2544,9 +2497,9 @@ func moveShiftAssignmentHandler(c *gin.Context) {
 	} else {
 		now := time.Now().Format("2006-01-02 15:04:05")
 		_, err = userDb.Exec(`
-			UPDATE shift_assignments SET shift_type = ?, overtime_shift = ?, work_hours = ?, updated_at = ?
+			UPDATE shift_assignments SET shift_type = ?, overtime_shift = ?, updated_at = ?
 			WHERE employee_id = ? AND date = ?
-		`, shiftType, srcOT, srcWorkHours, now, req.ToEmployeeID, req.ToDate)
+		`, shiftType, srcOT, now, req.ToEmployeeID, req.ToDate)
 		if err != nil {
 			log.Printf("Update target position error: %v", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "更新目标位置失败"})
@@ -2554,9 +2507,9 @@ func moveShiftAssignmentHandler(c *gin.Context) {
 		}
 
 		_, err = userDb.Exec(`
-			UPDATE shift_assignments SET shift_type = ?, overtime_shift = ?, work_hours = ?, updated_at = ?
+			UPDATE shift_assignments SET shift_type = ?, overtime_shift = ?, updated_at = ?
 			WHERE employee_id = ? AND date = ?
-		`, existingShift, tgtOT, tgtWorkHours, now, employeeID, req.FromDate)
+		`, existingShift, tgtOT, now, employeeID, req.FromDate)
 		if err != nil {
 			log.Printf("Update source position error: %v", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "更新源位置失败"})
