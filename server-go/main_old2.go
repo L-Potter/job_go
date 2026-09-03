@@ -2,6 +2,7 @@ package main
 
 import (
 	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
 	"embed"
@@ -121,6 +122,95 @@ type User struct {
 	MonthlyOvertimeCapHours *int       `json:"monthly_overtime_cap_hours"`
 	PasswordHash            string     `json:"-"`
 	CreatedAt               *Timestamp `json:"created_at"`
+	// 僅登入回應：供 admin/manager 呼叫待審註冊 API（Bearer），不來自資料庫欄位
+	SessionToken string `json:"session_token,omitempty"`
+}
+
+// managerSession — 登入後發給 role 為 admin/manager 的 API token（記憶體儲存）
+type managerSession struct {
+	EmployeeID string
+	Role       string
+	Expires    time.Time
+}
+
+var managerSessions sync.Map // token -> managerSession
+
+func newRandomAPIToken() string {
+	b := make([]byte, 24)
+	if _, err := rand.Read(b); err != nil {
+		return hex.EncodeToString([]byte(fmt.Sprintf("%d", time.Now().UnixNano())))
+	}
+	return hex.EncodeToString(b)
+}
+
+// issueManagerSession 在成功登入後為任何角色發放 session token，
+// 以便後端可從 Authorization 取得「作用者工號」寫入 admin_log。
+// 實際的功能權限由各 API 另行以 requireAdminOrManagerAPI 判定。
+func issueManagerSession(employeeID, role string) string {
+	if employeeID == "" {
+		return ""
+	}
+	token := newRandomAPIToken()
+	managerSessions.Store(token, managerSession{
+		EmployeeID: employeeID,
+		Role:       role,
+		Expires:    time.Now().Add(12 * time.Hour),
+	})
+	return token
+}
+
+func revokeManagerSession(token string) {
+	if token != "" {
+		managerSessions.Delete(token)
+	}
+}
+
+func managerSessionFromRequest(c *gin.Context) (managerSession, bool) {
+	h := c.GetHeader("Authorization")
+	const pfx = "Bearer "
+	if !strings.HasPrefix(h, pfx) {
+		return managerSession{}, false
+	}
+	token := strings.TrimSpace(strings.TrimPrefix(h, pfx))
+	if token == "" {
+		return managerSession{}, false
+	}
+	v, ok := managerSessions.Load(token)
+	if !ok {
+		return managerSession{}, false
+	}
+	s := v.(managerSession)
+	if time.Now().After(s.Expires) {
+		managerSessions.Delete(token)
+		return managerSession{}, false
+	}
+	return s, true
+}
+
+func requireAdminOrManagerAPI(c *gin.Context) bool {
+	s, ok := managerSessionFromRequest(c)
+	if !ok {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "請使用管理員或經理登入後取得的 session 存取此功能"})
+		return false
+	}
+	if s.Role != "admin" && s.Role != "manager" {
+		c.JSON(http.StatusForbidden, gin.H{"error": "僅限管理員或經理"})
+		return false
+	}
+	return true
+}
+
+func requireAdminAPI(c *gin.Context) bool {
+	s, ok := managerSessionFromRequest(c)
+	if !ok {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "請使用管理員或經理登入後取得的 session 存取此功能"})
+		return false
+	}
+	if s.Role != "admin" {
+		c.JSON(http.StatusForbidden, gin.H{"error": "僅限超級管理員"})
+		return false
+	}
+	return true
 }
 
 // safeLogOwnerEmployeeID 限制個人庫檔名（工號），避免路徑穿越。
@@ -789,6 +879,15 @@ func validRegistrationShiftSiteDayNight(shiftType, site, dayNight string) bool {
 	return true
 }
 
+// permitterLogSuffix 附於 admin_log details，明確標示「許可人」工號與角色（與 actor_employee_id 欄位一致）。
+func permitterLogSuffix(c *gin.Context) string {
+	s, ok := managerSessionFromRequest(c)
+	if !ok || s.EmployeeID == "" {
+		return ""
+	}
+	return fmt.Sprintf("；許可人：工號 %s（角色:%s）", s.EmployeeID, s.Role)
+}
+
 // ==================== Authentication Handlers ====================
 
 func loginHandler(c *gin.Context) {
@@ -853,6 +952,8 @@ func loginHandler(c *gin.Context) {
 	user.MonthlyOvertimeCapHours = intPtrFromNullInt64(monthlyCap)
 	user.CreatedAt = nilIfZeroTimestamp(createdAt)
 
+	user.SessionToken = issueManagerSession(user.EmployeeID, user.Role)
+
 	logAdminActionWithActor(
 		user.EmployeeID,
 		"登入成功",
@@ -865,6 +966,36 @@ func loginHandler(c *gin.Context) {
 }
 
 func logoutHandler(c *gin.Context) {
+	var body struct {
+		SessionToken string `json:"session_token"`
+	}
+	if c.Request.ContentLength > 0 {
+		_ = c.ShouldBindJSON(&body)
+	}
+	token := strings.TrimSpace(body.SessionToken)
+	if token == "" {
+		h := c.GetHeader("Authorization")
+		const pfx = "Bearer "
+		if strings.HasPrefix(h, pfx) {
+			token = strings.TrimSpace(strings.TrimPrefix(h, pfx))
+		}
+	}
+	var empID string
+	if token != "" {
+		if v, ok := managerSessions.Load(token); ok {
+			empID = v.(managerSession).EmployeeID
+		}
+	}
+	revokeManagerSession(token)
+	if empID != "" {
+		logAdminActionWithActor(
+			empID,
+			"登出",
+			"auth",
+			empID,
+			fmt.Sprintf("登出（%s）", authAuditContext(c)),
+		)
+	}
 	c.JSON(http.StatusOK, gin.H{"message": "登出成功"})
 }
 
@@ -1002,9 +1133,15 @@ func registerUserHandler(c *gin.Context) {
 	}
 	rid, _ := res.LastInsertId()
 	regMeta := fmt.Sprintf("班別:%s 廠區:%s 日夜班:%s", req.ShiftType, req.Site, req.DayNight)
+	actorID := req.EmployeeID
 	details := fmt.Sprintf("自助註冊送出（申請人姓名:%s 工號:%s；%s；registration_id=%d；%s）", req.Name, req.EmployeeID, regMeta, int(rid), authAuditContext(c))
+	if s, ok := managerSessionFromRequest(c); ok && (s.Role == "admin" || s.Role == "manager") {
+		actorID = s.EmployeeID
+		details = fmt.Sprintf("代為送出註冊申請（申請人姓名:%s 工號:%s；%s；操作者工號:%s 角色:%s；registration_id=%d；%s）",
+			req.Name, req.EmployeeID, regMeta, s.EmployeeID, s.Role, int(rid), authAuditContext(c))
+	}
 	logAdminActionWithActor(
-		req.EmployeeID,
+		actorID,
 		"REGISTER_SUBMIT",
 		"user_registrations",
 		fmt.Sprintf("%d", rid),
@@ -1017,6 +1154,9 @@ func registerUserHandler(c *gin.Context) {
 }
 
 func listUserRegistrationsHandler(c *gin.Context) {
+	if !requireAdminOrManagerAPI(c) {
+		return
+	}
 	rows, err := mainDB.Query(`
 		SELECT registration_id, name, employee_id, shift_type, site, day_night, created_at
 		FROM user_registrations
@@ -1066,6 +1206,9 @@ func listUserRegistrationsHandler(c *gin.Context) {
 }
 
 func approveUserRegistrationHandler(c *gin.Context) {
+	if !requireAdminOrManagerAPI(c) {
+		return
+	}
 	idStr := c.Param("id")
 	regID, err := strconv.Atoi(idStr)
 	if err != nil || regID <= 0 {
@@ -1176,7 +1319,7 @@ func approveUserRegistrationHandler(c *gin.Context) {
 		"APPROVE_REG",
 		"user_registrations",
 		employeeID,
-		fmt.Sprintf("核准註冊並建立正式帳號：%s（申請人工號 %s，新 user_id=%d；班別:%s 廠區:%s 日夜班:%s）", name, employeeID, userID, shift, site, dayNight),
+		fmt.Sprintf("核准註冊並建立正式帳號：%s（申請人工號 %s，新 user_id=%d；班別:%s 廠區:%s 日夜班:%s）%s", name, employeeID, userID, shift, site, dayNight, permitterLogSuffix(c)),
 	)
 
 	c.JSON(http.StatusOK, gin.H{
@@ -1193,6 +1336,9 @@ func approveUserRegistrationHandler(c *gin.Context) {
 }
 
 func rejectUserRegistrationHandler(c *gin.Context) {
+	if !requireAdminOrManagerAPI(c) {
+		return
+	}
 	idStr := c.Param("id")
 	regID, err := strconv.Atoi(idStr)
 	if err != nil || regID <= 0 {
@@ -1214,7 +1360,7 @@ func rejectUserRegistrationHandler(c *gin.Context) {
 		"REJECT_REG",
 		"user_registrations",
 		fmt.Sprint(regID),
-		fmt.Sprintf("拒絕註冊申請（registration_id=%d）", regID),
+		fmt.Sprintf("拒絕註冊申請（registration_id=%d）%s", regID, permitterLogSuffix(c)),
 	)
 	c.JSON(http.StatusOK, gin.H{"message": "已拒絕該筆申請"})
 }
@@ -1222,6 +1368,9 @@ func rejectUserRegistrationHandler(c *gin.Context) {
 // swapUsersDayNightByShiftHandler 僅 admin：將指定班別（A 或 B）下 day_night 為 D/N 的使用者互換日班／夜班。
 // 語意上等同先將 D 改為 NULL、再將 N 改為 D、再將（原 D）NULL 改為 N；以單一 CASE 更新避免誤改 day_night 原為 NULL 之列。
 func swapUsersDayNightByShiftHandler(c *gin.Context) {
+	if !requireAdminAPI(c) {
+		return
+	}
 	var req struct {
 		ShiftType string `json:"shift_type" binding:"required"`
 	}
@@ -1698,8 +1847,12 @@ func logAdminAction(action string, tableName string, recordID string, details st
 	logAdminActionWithActor("", action, tableName, recordID, details)
 }
 
-// actorEmployeeIDFromContext 保留既有日誌呼叫介面；存取權限由 UI 管理，後端不保留登入狀態。
-func actorEmployeeIDFromContext(_ *gin.Context) string {
+// actorEmployeeIDFromContext 從 Authorization bearer 對應的 managerSession 取得操作者工號。
+// 未登入或 session 無效時回傳空字串（由呼叫端自行決定是否以空字串記錄）。
+func actorEmployeeIDFromContext(c *gin.Context) string {
+	if s, ok := managerSessionFromRequest(c); ok {
+		return s.EmployeeID
+	}
 	return ""
 }
 
@@ -3035,8 +3188,16 @@ func deleteLeaveRecordHandler(c *gin.Context) {
 }
 
 func getLogsHandler(c *gin.Context) {
-	// 前端依目前登入者角色控制入口；這個值僅保留既有的日誌顯示篩選。
-	viewerIsAdmin := c.Query("viewer_role") == "admin"
+	sess, ok := managerSessionFromRequest(c)
+	if !ok {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "請使用管理員或經理登入後取得的 session 存取日誌"})
+		return
+	}
+	if sess.Role != "admin" && sess.Role != "manager" {
+		c.JSON(http.StatusForbidden, gin.H{"error": "僅限管理員或經理"})
+		return
+	}
+	viewerIsAdmin := sess.Role == "admin"
 
 	// employee_id → role（供 user_log 與 JOIN 缺漏時判斷作用者是否為 admin）
 	roleByEmpID := make(map[string]string)
@@ -3201,6 +3362,9 @@ type deleteLogEntryItem struct {
 }
 
 func deleteLogsBatchHandler(c *gin.Context) {
+	if !requireAdminAPI(c) {
+		return
+	}
 	var req struct {
 		Entries []deleteLogEntryItem `json:"entries" binding:"required"`
 	}
@@ -3273,6 +3437,9 @@ func deleteLogsBatchHandler(c *gin.Context) {
 }
 
 func deleteLogsBeforeHandler(c *gin.Context) {
+	if !requireAdminAPI(c) {
+		return
+	}
 	var req struct {
 		Before string `json:"before" binding:"required"`
 	}
