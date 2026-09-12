@@ -244,6 +244,7 @@ type LogEntry struct {
 	LogID           int        `json:"log_id"`
 	LogSource       string     `json:"log_source"`                  // "admin" | "user"
 	OwnerEmployeeID string     `json:"owner_employee_id,omitempty"` // user_log 所屬個人庫工號；admin_log 為空
+	ActorEmployeeID string     `json:"actor_employee_id,omitempty"` // 實際執行操作的工號；舊資料可能為空
 	User            string     `json:"user"`
 	Action          string     `json:"action"`
 	TableName       string     `json:"table_name"`
@@ -1740,9 +1741,10 @@ func logAdminAction(action string, tableName string, recordID string, details st
 	logAdminActionWithActor("", action, tableName, recordID, details)
 }
 
-// actorEmployeeIDFromContext 保留既有日誌呼叫介面；存取權限由 UI 管理，後端不保留登入狀態。
-func actorEmployeeIDFromContext(_ *gin.Context) string {
-	return ""
+// actorEmployeeIDFromContext 讀取前端依目前登入者帶入的工號，供日誌記錄實際操作者。
+// 現行系統未在後端保存登入 session，因此存取權限仍由 UI 管理。
+func actorEmployeeIDFromContext(c *gin.Context) string {
+	return strings.TrimSpace(c.GetHeader("X-Actor-Employee-ID"))
 }
 
 // ensureUserLogSchema 確保使用者個人資料庫的 user_log 表存在，
@@ -3360,6 +3362,7 @@ func getLogsHandler(c *gin.Context) {
 				l.User = "System Admin"
 			}
 			l.Details = details.String
+			l.ActorEmployeeID = actorEmp.String
 			l.CreatedAt = nilIfZeroTimestamp(created)
 			l.LogSource = "admin"
 			l.OwnerEmployeeID = ""
@@ -3430,6 +3433,7 @@ func getLogsHandler(c *gin.Context) {
 									}
 
 									l.CreatedAt = nilIfZeroTimestamp(created)
+									l.ActorEmployeeID = actorEmp.String
 									l.LogSource = "user"
 									l.OwnerEmployeeID = empID
 									allLogs = append(allLogs, l)

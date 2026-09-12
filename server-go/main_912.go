@@ -2,13 +2,13 @@ package main
 
 import (
 	"crypto/hmac"
-	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
 	"embed"
 	"encoding/hex"
 	"fmt"
 	"log"
+	"math"
 	"net"
 	"net/http"
 	"os"
@@ -110,106 +110,17 @@ func (t *Timestamp) Scan(value interface{}) error {
 }
 
 type User struct {
-	UserID                   int        `json:"user_id"`
-	Name                     string     `json:"name"`
-	EmployeeID               string     `json:"employee_id"`
-	ShiftType                *string    `json:"shift_type"`
-	Site                     *string    `json:"site"`
-	DayNight                 *string    `json:"day_night"`
-	Role                     string     `json:"role"`
-	Group                    string     `json:"group"`
-	MonthlyOvertimeCapHours  *int       `json:"monthly_overtime_cap_hours"`
-	PasswordHash             string     `json:"-"`
-	CreatedAt                *Timestamp `json:"created_at"`
-	// 僅登入回應：供 admin/manager 呼叫待審註冊 API（Bearer），不來自資料庫欄位
-	SessionToken string `json:"session_token,omitempty"`
-}
-
-// managerSession — 登入後發給 role 為 admin/manager 的 API token（記憶體儲存）
-type managerSession struct {
-	EmployeeID string
-	Role       string
-	Expires    time.Time
-}
-
-var managerSessions sync.Map // token -> managerSession
-
-func newRandomAPIToken() string {
-	b := make([]byte, 24)
-	if _, err := rand.Read(b); err != nil {
-		return hex.EncodeToString([]byte(fmt.Sprintf("%d", time.Now().UnixNano())))
-	}
-	return hex.EncodeToString(b)
-}
-
-// issueManagerSession 在成功登入後為任何角色發放 session token，
-// 以便後端可從 Authorization 取得「作用者工號」寫入 admin_log。
-// 實際的功能權限由各 API 另行以 requireAdminOrManagerAPI 判定。
-func issueManagerSession(employeeID, role string) string {
-	if employeeID == "" {
-		return ""
-	}
-	token := newRandomAPIToken()
-	managerSessions.Store(token, managerSession{
-		EmployeeID: employeeID,
-		Role:       role,
-		Expires:    time.Now().Add(12 * time.Hour),
-	})
-	return token
-}
-
-func revokeManagerSession(token string) {
-	if token != "" {
-		managerSessions.Delete(token)
-	}
-}
-
-func managerSessionFromRequest(c *gin.Context) (managerSession, bool) {
-	h := c.GetHeader("Authorization")
-	const pfx = "Bearer "
-	if !strings.HasPrefix(h, pfx) {
-		return managerSession{}, false
-	}
-	token := strings.TrimSpace(strings.TrimPrefix(h, pfx))
-	if token == "" {
-		return managerSession{}, false
-	}
-	v, ok := managerSessions.Load(token)
-	if !ok {
-		return managerSession{}, false
-	}
-	s := v.(managerSession)
-	if time.Now().After(s.Expires) {
-		managerSessions.Delete(token)
-		return managerSession{}, false
-	}
-	return s, true
-}
-
-func requireAdminOrManagerAPI(c *gin.Context) bool {
-	s, ok := managerSessionFromRequest(c)
-	if !ok {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "請使用管理員或經理登入後取得的 session 存取此功能"})
-		return false
-	}
-	if s.Role != "admin" && s.Role != "manager" {
-		c.JSON(http.StatusForbidden, gin.H{"error": "僅限管理員或經理"})
-		return false
-	}
-	return true
-}
-
-func requireAdminAPI(c *gin.Context) bool {
-	s, ok := managerSessionFromRequest(c)
-	if !ok {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "請使用管理員或經理登入後取得的 session 存取此功能"})
-		return false
-	}
-	if s.Role != "admin" {
-		c.JSON(http.StatusForbidden, gin.H{"error": "僅限超級管理員"})
-		return false
-	}
-	return true
+	UserID                  int        `json:"user_id"`
+	Name                    string     `json:"name"`
+	EmployeeID              string     `json:"employee_id"`
+	ShiftType               *string    `json:"shift_type"`
+	Site                    *string    `json:"site"`
+	DayNight                *string    `json:"day_night"`
+	Role                    string     `json:"role"`
+	Group                   string     `json:"group"`
+	MonthlyOvertimeCapHours *int       `json:"monthly_overtime_cap_hours"`
+	PasswordHash            string     `json:"-"`
+	CreatedAt               *Timestamp `json:"created_at"`
 }
 
 // safeLogOwnerEmployeeID 限制個人庫檔名（工號），避免路徑穿越。
@@ -260,6 +171,7 @@ type ShiftAssignment struct {
 	ShiftType     string     `json:"shift_type"`
 	Comment       string     `json:"comment"`
 	OvertimeShift *string    `json:"overtime_shift"`
+	WorkHours     *float64   `json:"work_hours"`
 	CreatedAt     *Timestamp `json:"created_at"`
 	UpdatedAt     *Timestamp `json:"updated_at"`
 }
@@ -273,7 +185,15 @@ func isAllowedOvertimeShift(s string) bool {
 	}
 }
 
-// ensureShiftAssignmentsSchema 建立表並為舊庫補上 overtime_shift 欄位
+func isValidWorkHours(v float64) bool {
+	if v < 0 || v > 15 {
+		return false
+	}
+	scaled := v * 100
+	return math.Abs(scaled-math.Round(scaled)) < 1e-9
+}
+
+// ensureShiftAssignmentsSchema 建立表並為舊庫補上 overtime_shift / work_hours 欄位
 func ensureShiftAssignmentsSchema(userDb *sql.DB) error {
 	_, err := userDb.Exec(`
 		CREATE TABLE IF NOT EXISTS shift_assignments (
@@ -282,6 +202,7 @@ func ensureShiftAssignmentsSchema(userDb *sql.DB) error {
 			shift_type     TEXT NOT NULL,
 			comment        TEXT,
 			overtime_shift TEXT,
+			work_hours     REAL,
 			created_at     DATETIME DEFAULT CURRENT_TIMESTAMP,
 			updated_at     DATETIME DEFAULT CURRENT_TIMESTAMP,
 			PRIMARY KEY (employee_id, date)
@@ -297,6 +218,16 @@ func ensureShiftAssignmentsSchema(userDb *sql.DB) error {
 	}
 	if n == 0 {
 		_, err = userDb.Exec(`ALTER TABLE shift_assignments ADD COLUMN overtime_shift TEXT`)
+		if err != nil {
+			return err
+		}
+	}
+	err = userDb.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('shift_assignments') WHERE name = 'work_hours'`).Scan(&n)
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		_, err = userDb.Exec(`ALTER TABLE shift_assignments ADD COLUMN work_hours REAL`)
 	}
 	return err
 }
@@ -613,6 +544,12 @@ func addRoutes(router *gin.Engine) {
 		api.PUT("/leave-types/:id", updateLeaveTypeHandler)
 		api.DELETE("/leave-types/:id", deleteLeaveTypeHandler)
 
+		// User groups routes
+		api.GET("/groups", getGroupsHandler)
+		api.POST("/groups", createGroupHandler)
+		api.PUT("/groups/:id", updateGroupHandler)
+		api.DELETE("/groups/:id", deleteGroupHandler)
+
 		// Leave records (per-employee DB, user_log audit)
 		api.GET("/leave-records/:employeeId", getLeaveRecordsHandler)
 		api.POST("/leave-records/:employeeId", createLeaveRecordHandler)
@@ -737,7 +674,17 @@ func createTables(db *sql.DB) error {
 		created_at      DATETIME DEFAULT CURRENT_TIMESTAMP
 	)`
 
-	tables := []string{usersTable, calendarTagsTable, leaveTypesTable, adminLogTable, userRegistrationsTable}
+	// User groups table
+	userGroupsTable := `
+	CREATE TABLE IF NOT EXISTS user_groups (
+		id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+		"group"            TEXT UNIQUE NOT NULL,
+		grouplimitnumber   INTEGER NOT NULL DEFAULT 3,
+		"allow overtime"   INTEGER NOT NULL DEFAULT 1,
+		allow_overtime     INTEGER NOT NULL DEFAULT 1
+	)`
+
+	tables := []string{usersTable, calendarTagsTable, leaveTypesTable, adminLogTable, userRegistrationsTable, userGroupsTable}
 	for _, table := range tables {
 		_, err := db.Exec(table)
 		if err != nil {
@@ -773,6 +720,32 @@ func createTables(db *sql.DB) error {
 			log.Printf("migrate admin_log.actor_employee_id: %v", err)
 		}
 	}
+
+	for _, mig := range []string{
+		`ALTER TABLE user_groups ADD COLUMN grouplimitnumber INTEGER NOT NULL DEFAULT 3`,
+		`ALTER TABLE user_groups ADD COLUMN "allow overtime" INTEGER NOT NULL DEFAULT 1`,
+		`ALTER TABLE user_groups ADD COLUMN allow_overtime INTEGER NOT NULL DEFAULT 1`,
+	} {
+		if _, err := db.Exec(mig); err != nil {
+			low := strings.ToLower(err.Error())
+			if !strings.Contains(low, "duplicate") && !strings.Contains(low, "already exists") {
+				log.Printf("migrate user_groups: %v", err)
+			}
+		}
+	}
+
+	_, _ = db.Exec(`CREATE VIEW IF NOT EXISTS groups AS SELECT id, "group", grouplimitnumber, "allow overtime", allow_overtime FROM user_groups`)
+
+	// Seed default groups if table is empty
+	var groupCount int
+	if err := db.QueryRow("SELECT COUNT(*) FROM user_groups").Scan(&groupCount); err == nil && groupCount == 0 {
+		defaultGroups := []string{"G1", "G2", "OCC", "ESH", "manager", "PTS"}
+		for _, g := range defaultGroups {
+			_, _ = db.Exec(`INSERT OR IGNORE INTO user_groups ("group", grouplimitnumber, "allow overtime", allow_overtime) VALUES (?, 3, 1, 1)`, g)
+		}
+	}
+	// Also insert any distinct non-empty group from users
+	_, _ = db.Exec(`INSERT OR IGNORE INTO user_groups ("group", grouplimitnumber, "allow overtime", allow_overtime) SELECT DISTINCT "group", 3, 1, 1 FROM users WHERE "group" IS NOT NULL AND "group" != '' AND "group" != '未定義'`)
 
 	return nil
 }
@@ -858,15 +831,6 @@ func validRegistrationShiftSiteDayNight(shiftType, site, dayNight string) bool {
 	return true
 }
 
-// permitterLogSuffix 附於 admin_log details，明確標示「許可人」工號與角色（與 actor_employee_id 欄位一致）。
-func permitterLogSuffix(c *gin.Context) string {
-	s, ok := managerSessionFromRequest(c)
-	if !ok || s.EmployeeID == "" {
-		return ""
-	}
-	return fmt.Sprintf("；許可人：工號 %s（角色:%s）", s.EmployeeID, s.Role)
-}
-
 // ==================== Authentication Handlers ====================
 
 func loginHandler(c *gin.Context) {
@@ -931,8 +895,6 @@ func loginHandler(c *gin.Context) {
 	user.MonthlyOvertimeCapHours = intPtrFromNullInt64(monthlyCap)
 	user.CreatedAt = nilIfZeroTimestamp(createdAt)
 
-	user.SessionToken = issueManagerSession(user.EmployeeID, user.Role)
-
 	logAdminActionWithActor(
 		user.EmployeeID,
 		"登入成功",
@@ -945,36 +907,6 @@ func loginHandler(c *gin.Context) {
 }
 
 func logoutHandler(c *gin.Context) {
-	var body struct {
-		SessionToken string `json:"session_token"`
-	}
-	if c.Request.ContentLength > 0 {
-		_ = c.ShouldBindJSON(&body)
-	}
-	token := strings.TrimSpace(body.SessionToken)
-	if token == "" {
-		h := c.GetHeader("Authorization")
-		const pfx = "Bearer "
-		if strings.HasPrefix(h, pfx) {
-			token = strings.TrimSpace(strings.TrimPrefix(h, pfx))
-		}
-	}
-	var empID string
-	if token != "" {
-		if v, ok := managerSessions.Load(token); ok {
-			empID = v.(managerSession).EmployeeID
-		}
-	}
-	revokeManagerSession(token)
-	if empID != "" {
-		logAdminActionWithActor(
-			empID,
-			"登出",
-			"auth",
-			empID,
-			fmt.Sprintf("登出（%s）", authAuditContext(c)),
-		)
-	}
 	c.JSON(http.StatusOK, gin.H{"message": "登出成功"})
 }
 
@@ -1112,30 +1044,21 @@ func registerUserHandler(c *gin.Context) {
 	}
 	rid, _ := res.LastInsertId()
 	regMeta := fmt.Sprintf("班別:%s 廠區:%s 日夜班:%s", req.ShiftType, req.Site, req.DayNight)
-	actorID := req.EmployeeID
 	details := fmt.Sprintf("自助註冊送出（申請人姓名:%s 工號:%s；%s；registration_id=%d；%s）", req.Name, req.EmployeeID, regMeta, int(rid), authAuditContext(c))
-	if s, ok := managerSessionFromRequest(c); ok && (s.Role == "admin" || s.Role == "manager") {
-		actorID = s.EmployeeID
-		details = fmt.Sprintf("代為送出註冊申請（申請人姓名:%s 工號:%s；%s；操作者工號:%s 角色:%s；registration_id=%d；%s）",
-			req.Name, req.EmployeeID, regMeta, s.EmployeeID, s.Role, int(rid), authAuditContext(c))
-	}
 	logAdminActionWithActor(
-		actorID,
+		req.EmployeeID,
 		"REGISTER_SUBMIT",
 		"user_registrations",
 		fmt.Sprintf("%d", rid),
 		details,
 	)
 	c.JSON(http.StatusCreated, gin.H{
-		"message":          "申請已送出，請待管理員核准後再登入",
+		"message":         "申請已送出，請待管理員核准後再登入",
 		"registration_id": int(rid),
 	})
 }
 
 func listUserRegistrationsHandler(c *gin.Context) {
-	if !requireAdminOrManagerAPI(c) {
-		return
-	}
 	rows, err := mainDB.Query(`
 		SELECT registration_id, name, employee_id, shift_type, site, day_night, created_at
 		FROM user_registrations
@@ -1151,12 +1074,12 @@ func listUserRegistrationsHandler(c *gin.Context) {
 
 	type row struct {
 		RegistrationID int    `json:"registration_id"`
-		Name             string `json:"name"`
-		EmployeeID       string `json:"employee_id"`
-		ShiftType        string `json:"shift_type"`
-		Site             string `json:"site"`
-		DayNight         string `json:"day_night"`
-		CreatedAt        string `json:"created_at"`
+		Name           string `json:"name"`
+		EmployeeID     string `json:"employee_id"`
+		ShiftType      string `json:"shift_type"`
+		Site           string `json:"site"`
+		DayNight       string `json:"day_night"`
+		CreatedAt      string `json:"created_at"`
 	}
 	// 空清單須為 JSON []；nil slice 會變成 null，前端 pendingRegs.length 會拋錯
 	out := make([]row, 0)
@@ -1185,9 +1108,6 @@ func listUserRegistrationsHandler(c *gin.Context) {
 }
 
 func approveUserRegistrationHandler(c *gin.Context) {
-	if !requireAdminOrManagerAPI(c) {
-		return
-	}
 	idStr := c.Param("id")
 	regID, err := strconv.Atoi(idStr)
 	if err != nil || regID <= 0 {
@@ -1298,26 +1218,23 @@ func approveUserRegistrationHandler(c *gin.Context) {
 		"APPROVE_REG",
 		"user_registrations",
 		employeeID,
-		fmt.Sprintf("核准註冊並建立正式帳號：%s（申請人工號 %s，新 user_id=%d；班別:%s 廠區:%s 日夜班:%s）%s", name, employeeID, userID, shift, site, dayNight, permitterLogSuffix(c)),
+		fmt.Sprintf("核准註冊並建立正式帳號：%s（申請人工號 %s，新 user_id=%d；班別:%s 廠區:%s 日夜班:%s）", name, employeeID, userID, shift, site, dayNight),
 	)
 
 	c.JSON(http.StatusOK, gin.H{
-		"user_id":      int(userID),
-		"name":         name,
-		"employee_id":  employeeID,
-		"shift_type":   shift,
-		"site":         site,
-		"day_night":    dayNight,
-		"role":         role,
-		"group":        group,
-		"message":      "已核准並建立帳號",
+		"user_id":     int(userID),
+		"name":        name,
+		"employee_id": employeeID,
+		"shift_type":  shift,
+		"site":        site,
+		"day_night":   dayNight,
+		"role":        role,
+		"group":       group,
+		"message":     "已核准並建立帳號",
 	})
 }
 
 func rejectUserRegistrationHandler(c *gin.Context) {
-	if !requireAdminOrManagerAPI(c) {
-		return
-	}
 	idStr := c.Param("id")
 	regID, err := strconv.Atoi(idStr)
 	if err != nil || regID <= 0 {
@@ -1339,7 +1256,7 @@ func rejectUserRegistrationHandler(c *gin.Context) {
 		"REJECT_REG",
 		"user_registrations",
 		fmt.Sprint(regID),
-		fmt.Sprintf("拒絕註冊申請（registration_id=%d）%s", regID, permitterLogSuffix(c)),
+		fmt.Sprintf("拒絕註冊申請（registration_id=%d）", regID),
 	)
 	c.JSON(http.StatusOK, gin.H{"message": "已拒絕該筆申請"})
 }
@@ -1347,9 +1264,6 @@ func rejectUserRegistrationHandler(c *gin.Context) {
 // swapUsersDayNightByShiftHandler 僅 admin：將指定班別（A 或 B）下 day_night 為 D/N 的使用者互換日班／夜班。
 // 語意上等同先將 D 改為 NULL、再將 N 改為 D、再將（原 D）NULL 改為 N；以單一 CASE 更新避免誤改 day_night 原為 NULL 之列。
 func swapUsersDayNightByShiftHandler(c *gin.Context) {
-	if !requireAdminAPI(c) {
-		return
-	}
 	var req struct {
 		ShiftType string `json:"shift_type" binding:"required"`
 	}
@@ -1487,15 +1401,15 @@ func getUserHandler(c *gin.Context) {
 
 func createUserHandler(c *gin.Context) {
 	var req struct {
-		Name                     string  `json:"name"`
-		EmployeeID               string  `json:"employee_id"`
-		Password                 string  `json:"password"`
-		ShiftType                *string `json:"shift_type"`
-		Site                     *string `json:"site"`
-		DayNight                 *string `json:"day_night"`
-		Role                     string  `json:"role"`
-		Group                    string  `json:"group"`
-		MonthlyOvertimeCapHours  *int    `json:"monthly_overtime_cap_hours"`
+		Name                    string  `json:"name"`
+		EmployeeID              string  `json:"employee_id"`
+		Password                string  `json:"password"`
+		ShiftType               *string `json:"shift_type"`
+		Site                    *string `json:"site"`
+		DayNight                *string `json:"day_night"`
+		Role                    string  `json:"role"`
+		Group                   string  `json:"group"`
+		MonthlyOvertimeCapHours *int    `json:"monthly_overtime_cap_hours"`
 	}
 
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -1583,16 +1497,16 @@ func updateUserHandler(c *gin.Context) {
 	userID := c.Param("id")
 
 	var req struct {
-		Name                     string  `json:"name"`
-		EmployeeID               string  `json:"employee_id"`
-		ShiftType                *string `json:"shift_type"`
-		Site                     *string `json:"site"`
-		DayNight                 *string `json:"day_night"`
-		Role                     string  `json:"role"`
-		Group                    *string `json:"group"`
-		Password                 string  `json:"password"`
-		MonthlyOvertimeCapHours  *int    `json:"monthly_overtime_cap_hours"`
-		ClearMonthlyOvertimeCap  *bool   `json:"clear_monthly_overtime_cap"`
+		Name                    string  `json:"name"`
+		EmployeeID              string  `json:"employee_id"`
+		ShiftType               *string `json:"shift_type"`
+		Site                    *string `json:"site"`
+		DayNight                *string `json:"day_night"`
+		Role                    string  `json:"role"`
+		Group                   *string `json:"group"`
+		Password                string  `json:"password"`
+		MonthlyOvertimeCapHours *int    `json:"monthly_overtime_cap_hours"`
+		ClearMonthlyOvertimeCap *bool   `json:"clear_monthly_overtime_cap"`
 	}
 
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -1826,12 +1740,8 @@ func logAdminAction(action string, tableName string, recordID string, details st
 	logAdminActionWithActor("", action, tableName, recordID, details)
 }
 
-// actorEmployeeIDFromContext 從 Authorization bearer 對應的 managerSession 取得操作者工號。
-// 未登入或 session 無效時回傳空字串（由呼叫端自行決定是否以空字串記錄）。
-func actorEmployeeIDFromContext(c *gin.Context) string {
-	if s, ok := managerSessionFromRequest(c); ok {
-		return s.EmployeeID
-	}
+// actorEmployeeIDFromContext 保留既有日誌呼叫介面；存取權限由 UI 管理，後端不保留登入狀態。
+func actorEmployeeIDFromContext(_ *gin.Context) string {
 	return ""
 }
 
@@ -2243,7 +2153,7 @@ func getShiftAssignmentsHandler(c *gin.Context) {
 
 	ensureUserLogSchema(userDb)
 
-	rows, err := userDb.Query("SELECT employee_id, date, shift_type, comment, overtime_shift, created_at, updated_at FROM shift_assignments ORDER BY date")
+	rows, err := userDb.Query("SELECT employee_id, date, shift_type, comment, overtime_shift, work_hours, created_at, updated_at FROM shift_assignments ORDER BY date")
 	if err != nil {
 		log.Printf("Get shift assignments error: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "获取排班数据失败"})
@@ -2256,9 +2166,10 @@ func getShiftAssignmentsHandler(c *gin.Context) {
 		var assignment ShiftAssignment
 		var comment sql.NullString
 		var overtimeShift sql.NullString
+		var workHours sql.NullFloat64
 		var createdAt, updatedAt sql.NullTime
 
-		err := rows.Scan(&assignment.EmployeeID, &assignment.Date, &assignment.ShiftType, &comment, &overtimeShift, &createdAt, &updatedAt)
+		err := rows.Scan(&assignment.EmployeeID, &assignment.Date, &assignment.ShiftType, &comment, &overtimeShift, &workHours, &createdAt, &updatedAt)
 		if err != nil {
 			log.Printf("Scan shift assignment error: %v", err)
 			continue
@@ -2268,6 +2179,10 @@ func getShiftAssignmentsHandler(c *gin.Context) {
 		if overtimeShift.Valid {
 			s := overtimeShift.String
 			assignment.OvertimeShift = &s
+		}
+		if workHours.Valid {
+			h := workHours.Float64
+			assignment.WorkHours = &h
 		}
 		assignment.CreatedAt = nilIfZeroTimestamp(createdAt)
 		assignment.UpdatedAt = nilIfZeroTimestamp(updatedAt)
@@ -2283,9 +2198,10 @@ func setShiftAssignmentHandler(c *gin.Context) {
 	date := c.Param("date")
 
 	var req struct {
-		ShiftType     string  `json:"shift_type"`
-		Comment       string  `json:"comment"`
-		OvertimeShift *string `json:"overtime_shift"`
+		ShiftType     string   `json:"shift_type"`
+		Comment       string   `json:"comment"`
+		OvertimeShift *string  `json:"overtime_shift"`
+		WorkHours     *float64 `json:"work_hours"`
 	}
 
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -2305,6 +2221,14 @@ func setShiftAssignmentHandler(c *gin.Context) {
 			return
 		}
 		overtimeShift = sql.NullString{String: *req.OvertimeShift, Valid: true}
+	}
+	var workHours sql.NullFloat64
+	if req.WorkHours != nil {
+		if !isValidWorkHours(*req.WorkHours) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "work_hours 僅能為 0~15 且最多小數點兩位"})
+			return
+		}
+		workHours = sql.NullFloat64{Float64: *req.WorkHours, Valid: true}
 	}
 
 	userDbPath := filepath.Join("..", fmt.Sprintf("%s.db", employeeID))
@@ -2333,14 +2257,15 @@ func setShiftAssignmentHandler(c *gin.Context) {
 
 	now := time.Now().Format("2006-01-02 15:04:05")
 	_, err = userDb.Exec(`
-		INSERT INTO shift_assignments (employee_id, date, shift_type, comment, overtime_shift, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO shift_assignments (employee_id, date, shift_type, comment, overtime_shift, work_hours, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(employee_id, date) DO UPDATE SET
 			shift_type = excluded.shift_type,
 			comment = excluded.comment,
 			overtime_shift = excluded.overtime_shift,
+			work_hours = excluded.work_hours,
 			updated_at = ?
-	`, employeeID, date, req.ShiftType, req.Comment, overtimeShift, now, now, now)
+	`, employeeID, date, req.ShiftType, req.Comment, overtimeShift, workHours, now, now, now)
 
 	if err != nil {
 		log.Printf("Save shift assignment error: %v", err)
@@ -2361,6 +2286,11 @@ func setShiftAssignmentHandler(c *gin.Context) {
 	} else {
 		resp["overtime_shift"] = nil
 	}
+	if workHours.Valid {
+		resp["work_hours"] = workHours.Float64
+	} else {
+		resp["work_hours"] = nil
+	}
 
 	c.JSON(http.StatusOK, resp)
 
@@ -2368,13 +2298,17 @@ func setShiftAssignmentHandler(c *gin.Context) {
 	if overtimeShift.Valid {
 		otLog = "，跨班加班:" + overtimeShift.String
 	}
+	whLog := ""
+	if workHours.Valid {
+		whLog = fmt.Sprintf("，工時:%.2f", workHours.Float64)
+	}
 	logUserActionWithActor(
 		userDb,
 		actorEmployeeIDFromContext(c),
 		"UPSERT",
 		"shift_assignments",
 		date,
-		fmt.Sprintf("假別:%s，備註:%s%s", req.ShiftType, req.Comment, otLog),
+		fmt.Sprintf("假別:%s，備註:%s%s%s", req.ShiftType, req.Comment, otLog, whLog),
 	)
 }
 
@@ -2465,7 +2399,8 @@ func moveShiftAssignmentHandler(c *gin.Context) {
 
 	var shiftType string
 	var srcOT sql.NullString
-	err = userDb.QueryRow("SELECT shift_type, overtime_shift FROM shift_assignments WHERE employee_id = ? AND date = ?", employeeID, req.FromDate).Scan(&shiftType, &srcOT)
+	var srcWorkHours sql.NullFloat64
+	err = userDb.QueryRow("SELECT shift_type, overtime_shift, work_hours FROM shift_assignments WHERE employee_id = ? AND date = ?", employeeID, req.FromDate).Scan(&shiftType, &srcOT, &srcWorkHours)
 	if err == sql.ErrNoRows {
 		c.JSON(http.StatusNotFound, gin.H{"error": "源排班不存在"})
 		return
@@ -2477,7 +2412,8 @@ func moveShiftAssignmentHandler(c *gin.Context) {
 
 	var existingShift string
 	var tgtOT sql.NullString
-	err = userDb.QueryRow("SELECT shift_type, overtime_shift FROM shift_assignments WHERE employee_id = ? AND date = ?", req.ToEmployeeID, req.ToDate).Scan(&existingShift, &tgtOT)
+	var tgtWorkHours sql.NullFloat64
+	err = userDb.QueryRow("SELECT shift_type, overtime_shift, work_hours FROM shift_assignments WHERE employee_id = ? AND date = ?", req.ToEmployeeID, req.ToDate).Scan(&existingShift, &tgtOT, &tgtWorkHours)
 
 	if err == sql.ErrNoRows {
 		now := time.Now().Format("2006-01-02 15:04:05")
@@ -2497,9 +2433,9 @@ func moveShiftAssignmentHandler(c *gin.Context) {
 	} else {
 		now := time.Now().Format("2006-01-02 15:04:05")
 		_, err = userDb.Exec(`
-			UPDATE shift_assignments SET shift_type = ?, overtime_shift = ?, updated_at = ?
+			UPDATE shift_assignments SET shift_type = ?, overtime_shift = ?, work_hours = ?, updated_at = ?
 			WHERE employee_id = ? AND date = ?
-		`, shiftType, srcOT, now, req.ToEmployeeID, req.ToDate)
+		`, shiftType, srcOT, srcWorkHours, now, req.ToEmployeeID, req.ToDate)
 		if err != nil {
 			log.Printf("Update target position error: %v", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "更新目标位置失败"})
@@ -2507,9 +2443,9 @@ func moveShiftAssignmentHandler(c *gin.Context) {
 		}
 
 		_, err = userDb.Exec(`
-			UPDATE shift_assignments SET shift_type = ?, overtime_shift = ?, updated_at = ?
+			UPDATE shift_assignments SET shift_type = ?, overtime_shift = ?, work_hours = ?, updated_at = ?
 			WHERE employee_id = ? AND date = ?
-		`, existingShift, tgtOT, now, employeeID, req.FromDate)
+		`, existingShift, tgtOT, tgtWorkHours, now, employeeID, req.FromDate)
 		if err != nil {
 			log.Printf("Update source position error: %v", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "更新源位置失败"})
@@ -2792,6 +2728,228 @@ func deleteLeaveTypeHandler(c *gin.Context) {
 	)
 
 	c.JSON(http.StatusOK, gin.H{"message": "请假类型删除成功"})
+}
+
+type UserGroup struct {
+	ID               int    `json:"id"`
+	Group            string `json:"group"`
+	GroupLimitNumber int    `json:"grouplimitnumber"`
+	AllowOvertime    int    `json:"allow_overtime"`
+	AllowOvertimeAlt int    `json:"allow overtime"`
+}
+
+type CreateUserGroupRequest struct {
+	Group            string `json:"group"`
+	GroupLimitNumber *int   `json:"grouplimitnumber"`
+	AllowOvertime    *int   `json:"allow_overtime"`
+	AllowOvertimeAlt *int   `json:"allow overtime"`
+}
+
+type UpdateUserGroupRequest struct {
+	Group            *string `json:"group"`
+	GroupLimitNumber *int    `json:"grouplimitnumber"`
+	AllowOvertime    *int    `json:"allow_overtime"`
+	AllowOvertimeAlt *int    `json:"allow overtime"`
+}
+
+func getGroupsHandler(c *gin.Context) {
+	rows, err := mainDB.Query(`SELECT id, "group", grouplimitnumber, "allow overtime" FROM user_groups ORDER BY id ASC`)
+	if err != nil {
+		log.Printf("Get groups error: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "獲取群組列表失敗"})
+		return
+	}
+	defer rows.Close()
+
+	var groups []UserGroup
+	for rows.Next() {
+		var g UserGroup
+		if err := rows.Scan(&g.ID, &g.Group, &g.GroupLimitNumber, &g.AllowOvertime); err != nil {
+			log.Printf("Scan group error: %v", err)
+			continue
+		}
+		g.AllowOvertimeAlt = g.AllowOvertime
+		groups = append(groups, g)
+	}
+	if groups == nil {
+		groups = []UserGroup{}
+	}
+	c.JSON(http.StatusOK, groups)
+}
+
+func createGroupHandler(c *gin.Context) {
+	var req CreateUserGroupRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "無效的請求內容"})
+		return
+	}
+	groupName := strings.TrimSpace(req.Group)
+	if groupName == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "群組名稱為必填項"})
+		return
+	}
+
+	limit := 3
+	if req.GroupLimitNumber != nil {
+		limit = *req.GroupLimitNumber
+	}
+	allowOvertime := 1
+	if req.AllowOvertime != nil {
+		allowOvertime = *req.AllowOvertime
+	} else if req.AllowOvertimeAlt != nil {
+		allowOvertime = *req.AllowOvertimeAlt
+	}
+
+	var existingID int
+	err := mainDB.QueryRow(`SELECT id FROM user_groups WHERE "group" = ?`, groupName).Scan(&existingID)
+	if err == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "此群組已存在"})
+		return
+	} else if err != sql.ErrNoRows {
+		log.Printf("Check group error: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "檢查群組名稱失敗"})
+		return
+	}
+
+	res, err := mainDB.Exec(`INSERT INTO user_groups ("group", grouplimitnumber, "allow overtime", allow_overtime) VALUES (?, ?, ?, ?)`, groupName, limit, allowOvertime, allowOvertime)
+	if err != nil {
+		log.Printf("Create group error: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "建立群組失敗"})
+		return
+	}
+	newID, _ := res.LastInsertId()
+
+	created := UserGroup{
+		ID:               int(newID),
+		Group:            groupName,
+		GroupLimitNumber: limit,
+		AllowOvertime:    allowOvertime,
+		AllowOvertimeAlt: allowOvertime,
+	}
+
+	logAdminActionWithActor(
+		actorEmployeeIDFromContext(c),
+		"CREATE",
+		"user_groups",
+		groupName,
+		fmt.Sprintf("建立群組：%s（id=%d，grouplimitnumber=%d，allow_overtime=%d）", groupName, newID, limit, allowOvertime),
+	)
+
+	c.JSON(http.StatusCreated, created)
+}
+
+func updateGroupHandler(c *gin.Context) {
+	idStr := c.Param("id")
+	var req UpdateUserGroupRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "無效的請求內容"})
+		return
+	}
+
+	var existingGroup UserGroup
+	err := mainDB.QueryRow(`SELECT id, "group", grouplimitnumber, "allow overtime" FROM user_groups WHERE id = ?`, idStr).Scan(
+		&existingGroup.ID, &existingGroup.Group, &existingGroup.GroupLimitNumber, &existingGroup.AllowOvertime,
+	)
+	if err == sql.ErrNoRows {
+		c.JSON(http.StatusNotFound, gin.H{"error": "群組不存在"})
+		return
+	} else if err != nil {
+		log.Printf("Query group error: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "查詢群組失敗"})
+		return
+	}
+
+	newGroupName := existingGroup.Group
+	if req.Group != nil {
+		trimmed := strings.TrimSpace(*req.Group)
+		if trimmed == "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "群組名稱不可為空"})
+			return
+		}
+		var dupID int
+		err = mainDB.QueryRow(`SELECT id FROM user_groups WHERE "group" = ? AND id != ?`, trimmed, idStr).Scan(&dupID)
+		if err == nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "此群組名稱已存在"})
+			return
+		} else if err != sql.ErrNoRows {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "檢查群組名稱失敗"})
+			return
+		}
+		newGroupName = trimmed
+	}
+
+	newLimit := existingGroup.GroupLimitNumber
+	if req.GroupLimitNumber != nil {
+		newLimit = *req.GroupLimitNumber
+	}
+
+	newAllowOvertime := existingGroup.AllowOvertime
+	if req.AllowOvertime != nil {
+		newAllowOvertime = *req.AllowOvertime
+	} else if req.AllowOvertimeAlt != nil {
+		newAllowOvertime = *req.AllowOvertimeAlt
+	}
+
+	_, err = mainDB.Exec(`UPDATE user_groups SET "group" = ?, grouplimitnumber = ?, "allow overtime" = ?, allow_overtime = ? WHERE id = ?`,
+		newGroupName, newLimit, newAllowOvertime, newAllowOvertime, idStr)
+	if err != nil {
+		log.Printf("Update group error: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "更新群組失敗"})
+		return
+	}
+
+	// If group name changed, update existing users with that group
+	if newGroupName != existingGroup.Group {
+		_, _ = mainDB.Exec(`UPDATE users SET "group" = ? WHERE "group" = ?`, newGroupName, existingGroup.Group)
+	}
+
+	logAdminActionWithActor(
+		actorEmployeeIDFromContext(c),
+		"UPDATE",
+		"user_groups",
+		newGroupName,
+		fmt.Sprintf("更新群組：%s（id=%s，grouplimitnumber: %d -> %d, allow_overtime: %d -> %d）",
+			newGroupName, idStr, existingGroup.GroupLimitNumber, newLimit, existingGroup.AllowOvertime, newAllowOvertime),
+	)
+
+	c.JSON(http.StatusOK, UserGroup{
+		ID:               existingGroup.ID,
+		Group:            newGroupName,
+		GroupLimitNumber: newLimit,
+		AllowOvertime:    newAllowOvertime,
+		AllowOvertimeAlt: newAllowOvertime,
+	})
+}
+
+func deleteGroupHandler(c *gin.Context) {
+	idStr := c.Param("id")
+
+	var groupName string
+	err := mainDB.QueryRow(`SELECT "group" FROM user_groups WHERE id = ?`, idStr).Scan(&groupName)
+	if err == sql.ErrNoRows {
+		c.JSON(http.StatusNotFound, gin.H{"error": "群組不存在"})
+		return
+	} else if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "查詢群組失敗"})
+		return
+	}
+
+	_, err = mainDB.Exec(`DELETE FROM user_groups WHERE id = ?`, idStr)
+	if err != nil {
+		log.Printf("Delete group error: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "刪除群組失敗"})
+		return
+	}
+
+	logAdminActionWithActor(
+		actorEmployeeIDFromContext(c),
+		"DELETE",
+		"user_groups",
+		groupName,
+		fmt.Sprintf("刪除群組：%s（id=%s）", groupName, idStr),
+	)
+
+	c.JSON(http.StatusOK, gin.H{"message": "群組刪除成功"})
 }
 
 // ensureLeaveRecordsSchema 確保各人員庫內 leave_records 表與 (user_id, leave_type_id, date) 唯一索引存在。
@@ -3141,16 +3299,8 @@ func deleteLeaveRecordHandler(c *gin.Context) {
 }
 
 func getLogsHandler(c *gin.Context) {
-	sess, ok := managerSessionFromRequest(c)
-	if !ok {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "請使用管理員或經理登入後取得的 session 存取日誌"})
-		return
-	}
-	if sess.Role != "admin" && sess.Role != "manager" {
-		c.JSON(http.StatusForbidden, gin.H{"error": "僅限管理員或經理"})
-		return
-	}
-	viewerIsAdmin := sess.Role == "admin"
+	// 前端依目前登入者角色控制入口；這個值僅保留既有的日誌顯示篩選。
+	viewerIsAdmin := c.Query("viewer_role") == "admin"
 
 	// employee_id → role（供 user_log 與 JOIN 缺漏時判斷作用者是否為 admin）
 	roleByEmpID := make(map[string]string)
@@ -3315,9 +3465,6 @@ type deleteLogEntryItem struct {
 }
 
 func deleteLogsBatchHandler(c *gin.Context) {
-	if !requireAdminAPI(c) {
-		return
-	}
 	var req struct {
 		Entries []deleteLogEntryItem `json:"entries" binding:"required"`
 	}
@@ -3390,9 +3537,6 @@ func deleteLogsBatchHandler(c *gin.Context) {
 }
 
 func deleteLogsBeforeHandler(c *gin.Context) {
-	if !requireAdminAPI(c) {
-		return
-	}
 	var req struct {
 		Before string `json:"before" binding:"required"`
 	}
