@@ -678,11 +678,12 @@ func createTables(db *sql.DB) error {
 	// User groups table
 	userGroupsTable := `
 	CREATE TABLE IF NOT EXISTS user_groups (
-		id                 INTEGER PRIMARY KEY AUTOINCREMENT,
-		"group"            TEXT UNIQUE NOT NULL,
-		grouplimitnumber   INTEGER NOT NULL DEFAULT 3,
-		"allow overtime"   INTEGER NOT NULL DEFAULT 1,
-		allow_overtime     INTEGER NOT NULL DEFAULT 1
+		id                           INTEGER PRIMARY KEY AUTOINCREMENT,
+		"group"                      TEXT UNIQUE NOT NULL,
+		grouplimitnumber             INTEGER NOT NULL DEFAULT 3,
+		groupovertimelimitnumber     INTEGER NOT NULL DEFAULT 3,
+		"allow overtime"             INTEGER NOT NULL DEFAULT 1,
+		allow_overtime               INTEGER NOT NULL DEFAULT 1
 	)`
 
 	tables := []string{usersTable, calendarTagsTable, leaveTypesTable, adminLogTable, userRegistrationsTable, userGroupsTable}
@@ -724,6 +725,7 @@ func createTables(db *sql.DB) error {
 
 	for _, mig := range []string{
 		`ALTER TABLE user_groups ADD COLUMN grouplimitnumber INTEGER NOT NULL DEFAULT 3`,
+		`ALTER TABLE user_groups ADD COLUMN groupovertimelimitnumber INTEGER NOT NULL DEFAULT 3`,
 		`ALTER TABLE user_groups ADD COLUMN "allow overtime" INTEGER NOT NULL DEFAULT 1`,
 		`ALTER TABLE user_groups ADD COLUMN allow_overtime INTEGER NOT NULL DEFAULT 1`,
 	} {
@@ -735,18 +737,19 @@ func createTables(db *sql.DB) error {
 		}
 	}
 
-	_, _ = db.Exec(`CREATE VIEW IF NOT EXISTS groups AS SELECT id, "group", grouplimitnumber, "allow overtime", allow_overtime FROM user_groups`)
+	_, _ = db.Exec(`DROP VIEW IF EXISTS groups`)
+	_, _ = db.Exec(`CREATE VIEW IF NOT EXISTS groups AS SELECT id, "group", grouplimitnumber, groupovertimelimitnumber, "allow overtime", allow_overtime FROM user_groups`)
 
 	// Seed default groups if table is empty
 	var groupCount int
 	if err := db.QueryRow("SELECT COUNT(*) FROM user_groups").Scan(&groupCount); err == nil && groupCount == 0 {
 		defaultGroups := []string{"G1", "G2", "OCC", "ESH", "manager", "PTS"}
 		for _, g := range defaultGroups {
-			_, _ = db.Exec(`INSERT OR IGNORE INTO user_groups ("group", grouplimitnumber, "allow overtime", allow_overtime) VALUES (?, 3, 1, 1)`, g)
+			_, _ = db.Exec(`INSERT OR IGNORE INTO user_groups ("group", grouplimitnumber, groupovertimelimitnumber, "allow overtime", allow_overtime) VALUES (?, 3, 3, 1, 1)`, g)
 		}
 	}
 	// Also insert any distinct non-empty group from users
-	_, _ = db.Exec(`INSERT OR IGNORE INTO user_groups ("group", grouplimitnumber, "allow overtime", allow_overtime) SELECT DISTINCT "group", 3, 1, 1 FROM users WHERE "group" IS NOT NULL AND "group" != '' AND "group" != '未定義'`)
+	_, _ = db.Exec(`INSERT OR IGNORE INTO user_groups ("group", grouplimitnumber, groupovertimelimitnumber, "allow overtime", allow_overtime) SELECT DISTINCT "group", 3, 3, 1, 1 FROM users WHERE "group" IS NOT NULL AND "group" != '' AND "group" != '未定義'`)
 
 	return nil
 }
@@ -2757,29 +2760,32 @@ func deleteLeaveTypeHandler(c *gin.Context) {
 }
 
 type UserGroup struct {
-	ID               int    `json:"id"`
-	Group            string `json:"group"`
-	GroupLimitNumber int    `json:"grouplimitnumber"`
-	AllowOvertime    int    `json:"allow_overtime"`
-	AllowOvertimeAlt int    `json:"allow overtime"`
+	ID                        int    `json:"id"`
+	Group                     string `json:"group"`
+	GroupLimitNumber          int    `json:"grouplimitnumber"`
+	GroupOvertimeLimitNumber  int    `json:"groupovertimelimitnumber"`
+	AllowOvertime             int    `json:"allow_overtime"`
+	AllowOvertimeAlt          int    `json:"allow overtime"`
 }
 
 type CreateUserGroupRequest struct {
-	Group            string `json:"group"`
-	GroupLimitNumber *int   `json:"grouplimitnumber"`
-	AllowOvertime    *int   `json:"allow_overtime"`
-	AllowOvertimeAlt *int   `json:"allow overtime"`
+	Group                     string `json:"group"`
+	GroupLimitNumber          *int   `json:"grouplimitnumber"`
+	GroupOvertimeLimitNumber  *int   `json:"groupovertimelimitnumber"`
+	AllowOvertime             *int   `json:"allow_overtime"`
+	AllowOvertimeAlt          *int   `json:"allow overtime"`
 }
 
 type UpdateUserGroupRequest struct {
-	Group            *string `json:"group"`
-	GroupLimitNumber *int    `json:"grouplimitnumber"`
-	AllowOvertime    *int    `json:"allow_overtime"`
-	AllowOvertimeAlt *int    `json:"allow overtime"`
+	Group                     *string `json:"group"`
+	GroupLimitNumber          *int    `json:"grouplimitnumber"`
+	GroupOvertimeLimitNumber  *int    `json:"groupovertimelimitnumber"`
+	AllowOvertime             *int    `json:"allow_overtime"`
+	AllowOvertimeAlt          *int    `json:"allow overtime"`
 }
 
 func getGroupsHandler(c *gin.Context) {
-	rows, err := mainDB.Query(`SELECT id, "group", grouplimitnumber, "allow overtime" FROM user_groups ORDER BY id ASC`)
+	rows, err := mainDB.Query(`SELECT id, "group", grouplimitnumber, groupovertimelimitnumber, "allow overtime" FROM user_groups ORDER BY id ASC`)
 	if err != nil {
 		log.Printf("Get groups error: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "獲取群組列表失敗"})
@@ -2790,7 +2796,7 @@ func getGroupsHandler(c *gin.Context) {
 	var groups []UserGroup
 	for rows.Next() {
 		var g UserGroup
-		if err := rows.Scan(&g.ID, &g.Group, &g.GroupLimitNumber, &g.AllowOvertime); err != nil {
+		if err := rows.Scan(&g.ID, &g.Group, &g.GroupLimitNumber, &g.GroupOvertimeLimitNumber, &g.AllowOvertime); err != nil {
 			log.Printf("Scan group error: %v", err)
 			continue
 		}
@@ -2819,6 +2825,10 @@ func createGroupHandler(c *gin.Context) {
 	if req.GroupLimitNumber != nil {
 		limit = *req.GroupLimitNumber
 	}
+	overtimeLimit := 3
+	if req.GroupOvertimeLimitNumber != nil {
+		overtimeLimit = *req.GroupOvertimeLimitNumber
+	}
 	allowOvertime := 1
 	if req.AllowOvertime != nil {
 		allowOvertime = *req.AllowOvertime
@@ -2837,7 +2847,7 @@ func createGroupHandler(c *gin.Context) {
 		return
 	}
 
-	res, err := mainDB.Exec(`INSERT INTO user_groups ("group", grouplimitnumber, "allow overtime", allow_overtime) VALUES (?, ?, ?, ?)`, groupName, limit, allowOvertime, allowOvertime)
+	res, err := mainDB.Exec(`INSERT INTO user_groups ("group", grouplimitnumber, groupovertimelimitnumber, "allow overtime", allow_overtime) VALUES (?, ?, ?, ?, ?)`, groupName, limit, overtimeLimit, allowOvertime, allowOvertime)
 	if err != nil {
 		log.Printf("Create group error: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "建立群組失敗"})
@@ -2846,11 +2856,12 @@ func createGroupHandler(c *gin.Context) {
 	newID, _ := res.LastInsertId()
 
 	created := UserGroup{
-		ID:               int(newID),
-		Group:            groupName,
-		GroupLimitNumber: limit,
-		AllowOvertime:    allowOvertime,
-		AllowOvertimeAlt: allowOvertime,
+		ID:                       int(newID),
+		Group:                    groupName,
+		GroupLimitNumber:         limit,
+		GroupOvertimeLimitNumber: overtimeLimit,
+		AllowOvertime:            allowOvertime,
+		AllowOvertimeAlt:         allowOvertime,
 	}
 
 	logAdminActionWithActor(
@@ -2858,7 +2869,7 @@ func createGroupHandler(c *gin.Context) {
 		"CREATE",
 		"user_groups",
 		groupName,
-		fmt.Sprintf("建立群組：%s（id=%d，grouplimitnumber=%d，allow_overtime=%d）", groupName, newID, limit, allowOvertime),
+		fmt.Sprintf("建立群組：%s（id=%d，grouplimitnumber=%d，groupovertimelimitnumber=%d，allow_overtime=%d）", groupName, newID, limit, overtimeLimit, allowOvertime),
 	)
 
 	c.JSON(http.StatusCreated, created)
@@ -2873,8 +2884,8 @@ func updateGroupHandler(c *gin.Context) {
 	}
 
 	var existingGroup UserGroup
-	err := mainDB.QueryRow(`SELECT id, "group", grouplimitnumber, "allow overtime" FROM user_groups WHERE id = ?`, idStr).Scan(
-		&existingGroup.ID, &existingGroup.Group, &existingGroup.GroupLimitNumber, &existingGroup.AllowOvertime,
+	err := mainDB.QueryRow(`SELECT id, "group", grouplimitnumber, groupovertimelimitnumber, "allow overtime" FROM user_groups WHERE id = ?`, idStr).Scan(
+		&existingGroup.ID, &existingGroup.Group, &existingGroup.GroupLimitNumber, &existingGroup.GroupOvertimeLimitNumber, &existingGroup.AllowOvertime,
 	)
 	if err == sql.ErrNoRows {
 		c.JSON(http.StatusNotFound, gin.H{"error": "群組不存在"})
@@ -2909,6 +2920,11 @@ func updateGroupHandler(c *gin.Context) {
 		newLimit = *req.GroupLimitNumber
 	}
 
+	newOvertimeLimit := existingGroup.GroupOvertimeLimitNumber
+	if req.GroupOvertimeLimitNumber != nil {
+		newOvertimeLimit = *req.GroupOvertimeLimitNumber
+	}
+
 	newAllowOvertime := existingGroup.AllowOvertime
 	if req.AllowOvertime != nil {
 		newAllowOvertime = *req.AllowOvertime
@@ -2916,8 +2932,8 @@ func updateGroupHandler(c *gin.Context) {
 		newAllowOvertime = *req.AllowOvertimeAlt
 	}
 
-	_, err = mainDB.Exec(`UPDATE user_groups SET "group" = ?, grouplimitnumber = ?, "allow overtime" = ?, allow_overtime = ? WHERE id = ?`,
-		newGroupName, newLimit, newAllowOvertime, newAllowOvertime, idStr)
+	_, err = mainDB.Exec(`UPDATE user_groups SET "group" = ?, grouplimitnumber = ?, groupovertimelimitnumber = ?, "allow overtime" = ?, allow_overtime = ? WHERE id = ?`,
+		newGroupName, newLimit, newOvertimeLimit, newAllowOvertime, newAllowOvertime, idStr)
 	if err != nil {
 		log.Printf("Update group error: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "更新群組失敗"})
@@ -2934,16 +2950,17 @@ func updateGroupHandler(c *gin.Context) {
 		"UPDATE",
 		"user_groups",
 		newGroupName,
-		fmt.Sprintf("更新群組：%s（id=%s，grouplimitnumber: %d -> %d, allow_overtime: %d -> %d）",
-			newGroupName, idStr, existingGroup.GroupLimitNumber, newLimit, existingGroup.AllowOvertime, newAllowOvertime),
+		fmt.Sprintf("更新群組：%s（id=%s，grouplimitnumber: %d -> %d, groupovertimelimitnumber: %d -> %d, allow_overtime: %d -> %d）",
+			newGroupName, idStr, existingGroup.GroupLimitNumber, newLimit, existingGroup.GroupOvertimeLimitNumber, newOvertimeLimit, existingGroup.AllowOvertime, newAllowOvertime),
 	)
 
 	c.JSON(http.StatusOK, UserGroup{
-		ID:               existingGroup.ID,
-		Group:            newGroupName,
-		GroupLimitNumber: newLimit,
-		AllowOvertime:    newAllowOvertime,
-		AllowOvertimeAlt: newAllowOvertime,
+		ID:                       existingGroup.ID,
+		Group:                    newGroupName,
+		GroupLimitNumber:         newLimit,
+		GroupOvertimeLimitNumber: newOvertimeLimit,
+		AllowOvertime:            newAllowOvertime,
+		AllowOvertimeAlt:         newAllowOvertime,
 	})
 }
 
